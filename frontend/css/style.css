@@ -82,6 +82,11 @@
   box-sizing: border-box;
 }
 
+/* Class rules like .lightbox { display: flex } beat the UA [hidden] style. */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
