@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 THUMB_PREFIX = "thumbs"
 DISPLAY_PREFIX = "display"
+POSTER_PREFIX = "posters"
 JPEG_EXTENSION = "jpg"
 
 logger = logging.getLogger("wedding.thumbnails")
@@ -76,6 +77,11 @@ def thumb_key_for(key: str) -> str:
 
 def display_key_for(key: str) -> str:
     return derive_key(key, DISPLAY_PREFIX)
+
+
+def poster_key_for(key: str) -> str:
+    """uploads/…/<uuid>.mp4 -> posters/…/<uuid>.jpg (poster frame for video)."""
+    return derive_key(key, POSTER_PREFIX)
 
 
 def generate_thumbnail(data: bytes, size: int = 400) -> bytes | None:

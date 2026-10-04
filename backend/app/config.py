@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     s3_mock: bool = Field(default=False, alias="S3_MOCK")
     presign_expires_seconds: int = Field(default=3600, alias="PRESIGN_EXPIRES_SECONDS")
 
+    # Generate a poster frame (ffmpeg) for uploaded videos so the gallery tile
+    # shows a real preview instead of a blank play button.
+    video_poster: bool = Field(default=True, alias="VIDEO_POSTER")
+    ffmpeg_binary: str = Field(default="ffmpeg", alias="FFMPEG_BINARY")
+
+    # Moderation: when true, new uploads are kept out of the gallery until an
+    # admin approves them (approval clears the pending flag).
+    pre_moderation: bool = Field(default=False, alias="PRE_MODERATION")
+
+    # Background maintenance (0 disables the timer):
+    #   BACKUP_HOURS         — interval between SQLite backups;
+    #   BACKUP_KEEP          — how many old backups to keep;
+    #   ORPHAN_MAX_AGE_HOURS — delete objects with no DB row older than this.
+    backup_hours: int = Field(default=0, alias="BACKUP_HOURS")
+    backup_keep: int = Field(default=7, alias="BACKUP_KEEP")
+    orphan_max_age_hours: int = Field(default=24, alias="ORPHAN_MAX_AGE_HOURS")
+
     site_domain: str = Field(default="", alias="SITE_DOMAIN")
     cors_origins: str = Field(default="", alias="CORS_ORIGINS")
 

@@ -1,0 +1,14 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-unconfirmed-uploads",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "uploads/"
+      },
+      "Expiration": {
+        "Days": 7
+      }
+    }
+  ]
+}

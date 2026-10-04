@@ -5,12 +5,22 @@ from __future__ import annotations
 import asyncio
 import hmac
 import logging
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Union
+from zipfile import ZIP_STORED, ZipFile
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +33,8 @@ from app.config import (
 )
 from app.db import PhotoRepository, resolve_db_path
 from app.filetype import SNIFF_BYTES, content_matches
+from app.maintenance import maintenance_loop
+from app.poster import generate_poster_from_bytes, generate_poster_from_path
 from app.rate_limit import RateLimiter
 from app.thumbnails import image_dimensions, sanitize_original
 from app.schemas import (
@@ -31,6 +43,7 @@ from app.schemas import (
     ConfirmRequest,
     ConfirmResponse,
     DeleteResponse,
+    GuestsResponse,
     HealthResponse,
     PhotoListResponse,
     PhotoPatchRequest,
@@ -48,6 +61,7 @@ _repo: PhotoRepository | None = None
 _limiter: RateLimiter | None = None
 _admin_limiter: RateLimiter | None = None
 _storage: Storage | None = None
+_maintenance_task: asyncio.Task | None = None
 
 logger = logging.getLogger("wedding")
 # uvicorn configures only its own loggers; without a handler our INFO lines are
@@ -135,7 +149,7 @@ def _frontend_dir(settings: Settings) -> Path | None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    global _repo, _limiter, _admin_limiter, _storage
+    global _repo, _limiter, _admin_limiter, _storage, _maintenance_task
     settings = get_settings()
     _repo = PhotoRepository(resolve_db_path(settings.database_path))
     await _repo.init()
@@ -145,7 +159,17 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _storage = create_storage(settings)
     _storage.ensure_ready()
     await _backfill_derived(_repo, _storage)
-    yield
+    _maintenance_task = asyncio.create_task(maintenance_loop(_repo, _storage, settings))
+    try:
+        yield
+    finally:
+        if _maintenance_task is not None:
+            _maintenance_task.cancel()
+            try:
+                await _maintenance_task
+            except asyncio.CancelledError:
+                pass
+            _maintenance_task = None
 
 
 def get_repo() -> PhotoRepository:
@@ -301,11 +325,17 @@ def _build_photo(
             if kind == "image"
             else None
         ),
+        "poster_url": (
+            storage.poster_url(key, base)
+            if kind == "video"
+            else None
+        ),
     }
     if admin:
         payload["client_ip"] = row.get("client_ip", "")
         payload["guest_name"] = row.get("guest_name", "")
         payload["hidden"] = bool(row.get("hidden", 0))
+        payload["pending"] = bool(row.get("pending", 0))
     return payload
 
 
@@ -398,6 +428,71 @@ def _require_yandex(storage: Storage) -> YandexStorage:
             detail="Этот эндпоинт доступен только при STORAGE_BACKEND=yandex.",
         )
     return storage
+
+
+def _make_local_poster(
+    local: LocalStorage, key: str, ffmpeg: str
+) -> Path | None:
+    """Extract a poster frame for a just-saved local video (best-effort)."""
+    try:
+        poster = generate_poster_from_path(local.absolute_path(key), ffmpeg)
+    except Exception:
+        return None
+    if not poster:
+        return None
+    return local.save_poster(key, poster)
+
+
+def _make_yandex_poster(
+    yandex: YandexStorage, key: str, ffmpeg: str
+) -> bool:
+    """Download a bucket video once and extract a poster frame (best-effort)."""
+    try:
+        data = yandex.get_bytes(key)
+        if not data:
+            return False
+        poster = generate_poster_from_bytes(data, ffmpeg)
+        if not poster:
+            return False
+        return yandex.save_poster(key, poster)
+    except Exception:
+        logger.warning("Не удалось создать постер видео %s", key)
+        return False
+
+
+def _unlink_later(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _build_archive(storage: Storage, rows: list[dict[str, Any]]) -> str | None:
+    """Zip all visible originals into a temp file; returns its path or None."""
+    if not rows:
+        return None
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="wedding-archive-", suffix=".zip", delete=False
+    )
+    tmp_path = tmp.name
+    tmp.close()
+    with ZipFile(tmp_path, "w", compression=ZIP_STORED) as zf:
+        for row in rows:
+            key = row["object_key"]
+            arcname = key.replace("uploads/", "", 1)
+            if isinstance(storage, LocalStorage):
+                try:
+                    src = storage.absolute_path(key)
+                except ValueError:
+                    continue
+                if not src.is_file():
+                    continue
+                zf.write(src, arcname)
+            else:
+                data = storage.get_bytes(key)
+                if data:
+                    zf.writestr(arcname, data)
+    return tmp_path
 
 
 def _register_routes(api: FastAPI) -> None:
@@ -499,6 +594,8 @@ def _register_routes(api: FastAPI) -> None:
                 )
             else:
                 local.save_bytes(key, data)
+                if settings.video_poster:
+                    await asyncio.to_thread(_make_local_poster, local, key, settings.ffmpeg_binary)
             row = await repo.add(
                 object_key=key,
                 content_type=content_type,
@@ -506,6 +603,7 @@ def _register_routes(api: FastAPI) -> None:
                 uploaded_at=now,
                 client_ip=ip,
                 guest_name=_guest_name(request),
+                pending=settings.pre_moderation,
                 thumb_width=dims[0] if dims else None,
                 thumb_height=dims[1] if dims else None,
                 display_width=dims[0] if dims else None,
@@ -527,6 +625,11 @@ def _register_routes(api: FastAPI) -> None:
                         display_url=(
                             local.display_url(key, base)
                             if kind_of(content_type) == "image"
+                            else None
+                        ),
+                        poster_url=(
+                            local.poster_url(key, base)
+                            if kind_of(content_type) == "video"
                             else None
                         ),
                     )
@@ -658,6 +761,14 @@ def _register_routes(api: FastAPI) -> None:
 
             size_bytes = result.get("size") or file_in.size_bytes
             dims = result.get("dims")
+            if (
+                result["kind"] == "video"
+                and settings.video_poster
+                and not yandex.settings.s3_mock
+            ):
+                await asyncio.to_thread(
+                    _make_yandex_poster, yandex, file_in.key, settings.ffmpeg_binary
+                )
             row = await repo.add(
                 object_key=file_in.key,
                 content_type=content_type,
@@ -665,6 +776,7 @@ def _register_routes(api: FastAPI) -> None:
                 uploaded_at=now,
                 client_ip=ip,
                 guest_name=_guest_name(request),
+                pending=settings.pre_moderation,
                 thumb_width=dims[0] if dims else None,
                 thumb_height=dims[1] if dims else None,
                 display_width=dims[0] if dims else None,
@@ -688,6 +800,11 @@ def _register_routes(api: FastAPI) -> None:
                             if kind_of(content_type) == "image"
                             else None
                         ),
+                        poster_url=(
+                            yandex.poster_url(file_in.key, base)
+                            if kind_of(content_type) == "video"
+                            else None
+                        ),
                     )
                 )
         return ConfirmResponse(ok=True, saved=saved)
@@ -701,6 +818,7 @@ def _register_routes(api: FastAPI) -> None:
         limit: int = 48,
         offset: int = 0,
         kind: str = "all",
+        guest: str | None = None,
     ) -> PhotoListResponse:
         # Public gallery is deliberately NOT rate-limited: guests on one network
         # shouldn't be blocked, and the endpoint is cheap (metadata only).
@@ -709,9 +827,14 @@ def _register_routes(api: FastAPI) -> None:
         if kind not in ("all", "image", "video"):
             kind = "all"
         rows = await repo.list_recent(
-            limit=limit, offset=offset, hidden=False, kind=kind
+            limit=limit,
+            offset=offset,
+            hidden=False,
+            pending=False,
+            kind=kind,
+            guest=guest or None,
         )
-        total = await repo.count(hidden=False, kind=kind)
+        total = await repo.count(hidden=False, pending=False, kind=kind, guest=guest or None)
         base = settings.base_path
         items = [_build_photo(row, storage, base) for row in rows]
         return PhotoListResponse(
@@ -721,6 +844,25 @@ def _register_routes(api: FastAPI) -> None:
             offset=offset,
             has_more=offset + len(items) < total,
         )
+
+    @api.get("/api/photos/guests", response_model=GuestsResponse)
+    async def list_guests(
+        request: Request,
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> GuestsResponse:
+        # Names are public (they already appear in the gallery) and cheap; not
+        # rate-limited like the gallery listing.
+        return GuestsResponse(guests=await repo.list_guests(approved_only=True))
+
+    @api.get("/api/admin/photos/guests", response_model=GuestsResponse)
+    async def admin_list_guests(
+        request: Request,
+        settings: Annotated[Settings, Depends(get_settings)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> GuestsResponse:
+        # Admin sees every uploader's name, including pending / hidden items.
+        require_admin(request, settings)
+        return GuestsResponse(guests=await repo.list_guests(approved_only=False))
 
     @api.get("/api/admin/photos", response_model=AdminListResponse)
     async def admin_list_photos(
@@ -732,14 +874,23 @@ def _register_routes(api: FastAPI) -> None:
         offset: int = 0,
         kind: str = "all",
         hidden: bool | None = None,
+        pending: bool | None = None,
+        guest: str | None = None,
     ) -> AdminListResponse:
         require_admin(request, settings)
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
         if kind not in ("all", "image", "video"):
             kind = "all"
-        rows = await repo.list_recent(limit=limit, offset=offset, hidden=hidden, kind=kind)
-        total = await repo.count(hidden=hidden, kind=kind)
+        rows = await repo.list_recent(
+            limit=limit,
+            offset=offset,
+            hidden=hidden,
+            pending=pending,
+            kind=kind,
+            guest=guest or None,
+        )
+        total = await repo.count(hidden=hidden, pending=pending, kind=kind, guest=guest or None)
         base = settings.base_path
         items = [_build_photo(row, storage, base, admin=True) for row in rows]
         return AdminListResponse(
@@ -751,7 +902,7 @@ def _register_routes(api: FastAPI) -> None:
         )
 
     @api.patch("/api/admin/photos/{photo_id}", response_model=AdminPhotoOut)
-    async def admin_set_hidden(
+    async def admin_update_photo(
         photo_id: int,
         body: PhotoPatchRequest,
         request: Request,
@@ -760,7 +911,13 @@ def _register_routes(api: FastAPI) -> None:
         repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> AdminPhotoOut:
         require_admin(request, settings)
-        row = await repo.set_hidden(photo_id, body.hidden)
+        row = await repo.get_by_id(photo_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Фото не найдено.")
+        if body.hidden is not None:
+            row = await repo.set_hidden(photo_id, body.hidden)
+        if body.pending is not None:
+            row = await repo.set_pending(photo_id, body.pending)
         if row is None:
             raise HTTPException(status_code=404, detail="Фото не найдено.")
         return AdminPhotoOut(**_build_photo(row, storage, settings.base_path, admin=True))
@@ -778,12 +935,14 @@ def _register_routes(api: FastAPI) -> None:
         if row is None:
             raise HTTPException(status_code=404, detail="Фото не найдено.")
         key = row["object_key"]
-        is_img = kind_of(row["content_type"]) == "image"
+        kind = kind_of(row["content_type"])
         # Delete originals/derivatives; only drop the DB row if the object is gone.
         deleted = await asyncio.to_thread(storage.delete, key)
-        if is_img:
+        if kind == "image":
             await asyncio.to_thread(storage.delete, storage.thumb_key(key))
             await asyncio.to_thread(storage.delete, storage.display_key(key))
+        else:
+            await asyncio.to_thread(storage.delete, storage.poster_key(key))
         if not deleted and storage.is_ready():
             raise HTTPException(
                 status_code=500,
@@ -791,6 +950,28 @@ def _register_routes(api: FastAPI) -> None:
             )
         await repo.delete(photo_id)
         return DeleteResponse(ok=True)
+
+    @api.get("/api/admin/photos/archive.zip")
+    async def admin_download_archive(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        settings: Annotated[Settings, Depends(get_settings)],
+        storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> FileResponse:
+        """Zip of every visible original — the couple's "all photos" backup."""
+        require_admin(request, settings)
+        rows = await repo.list_all(hidden=False, pending=False)
+        path = await asyncio.to_thread(_build_archive, storage, rows)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Нет опубликованных фото.")
+        background_tasks.add_task(_unlink_later, path)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=f"wedding-photos-{stamp}.zip",
+        )
 
     @api.get("/api/files/{key:path}")
     async def serve_file(
@@ -800,7 +981,7 @@ def _register_routes(api: FastAPI) -> None:
     ) -> FileResponse:
         local = _require_local(storage)
         prefix = key.split("/", 1)[0]
-        if prefix not in ("uploads", "thumbs", "display"):
+        if prefix not in ("uploads", "thumbs", "display", "posters"):
             raise HTTPException(status_code=400, detail="Недопустимый ключ.")
         try:
             path = local.absolute_path(key)
@@ -809,9 +990,10 @@ def _register_routes(api: FastAPI) -> None:
         if not path.is_file():
             raise HTTPException(status_code=404, detail="Файл не найден.")
 
-        # Derived images are always public (EXIF-free). Originals are withheld
-        # for hidden photos so "hide" actually removes direct-link access.
-        if prefix in ("thumbs", "display"):
+        # Derived images (thumbs, display, video posters) are always public
+        # (EXIF-free, single frame). Originals are withheld for hidden photos so
+        # "hide" actually removes direct-link access.
+        if prefix in ("thumbs", "display", "posters"):
             return FileResponse(path, media_type="image/jpeg")
 
         meta = await repo.get_by_key(key)

@@ -179,7 +179,7 @@ install_packages() {
     apt)
       run apt-get update -y
       run DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        python3 python3-venv python3-pip nginx curl ca-certificates
+        python3 python3-venv python3-pip nginx curl ca-certificates ffmpeg
       if [[ "${ENABLE_HTTPS}" == "yes" ]]; then
         run DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
       fi

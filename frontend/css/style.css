@@ -605,6 +605,37 @@ a {
   margin-top: 1rem;
 }
 
+.gallery-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.guest-label {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.guest-select {
+  flex: 1;
+  min-width: 0;
+  background: rgba(11, 20, 16, 0.5);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--gold-light);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  min-height: 36px;
+}
+
+.guest-select:focus {
+  outline: none;
+  border-color: var(--gold);
+}
+
 .empty,
 .loading,
 .error-box {

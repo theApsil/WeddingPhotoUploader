@@ -17,6 +17,7 @@ const state = {
   offset: 0,
   total: 0,
   kind: "all",
+  guest: "",
   loading: false,
   current: -1,
   hasMore: false,
@@ -43,6 +44,15 @@ function makeTile(item, index) {
   tile.title = `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}`;
 
   if (item.kind === "video") {
+    if (item.poster_url) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = "Видео";
+      img.src = item.poster_url;
+      img.onerror = () => img.remove(); // keep the play icon if no poster frame
+      tile.appendChild(img);
+    }
     const play = document.createElement("span");
     play.className = "tile-play";
     play.textContent = "▶";
@@ -81,6 +91,10 @@ function renderTotal() {
   els.total.textContent = `${label} · ${state.total}`;
 }
 
+function guestQuery() {
+  return state.guest ? `&guest=${encodeURIComponent(state.guest)}` : "";
+}
+
 function renderLoadMore() {
   const remaining = state.total - state.items.length;
   if (state.items.length > 0 && remaining > 0) {
@@ -114,7 +128,7 @@ async function load(reset = false) {
 
   try {
     const data = await api(
-      `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}`,
+      `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}${guestQuery()}`,
     );
     state.total = data.total;
     state.hasMore = data.has_more;
@@ -230,6 +244,37 @@ function bindFilters() {
       load(true);
     });
   });
+
+  const guestSel = document.getElementById("guest-filter");
+  if (guestSel) {
+    guestSel.addEventListener("change", () => {
+      if (state.loading) return;
+      state.guest = guestSel.value;
+      load(true);
+    });
+  }
+}
+
+async function loadGuests() {
+  const guestSel = document.getElementById("guest-filter");
+  if (!guestSel) return;
+  try {
+    const data = await api("/api/photos/guests");
+    const options = data.guests || [];
+    guestSel.innerHTML = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "Все";
+    guestSel.appendChild(all);
+    options.forEach((name) => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      guestSel.appendChild(opt);
+    });
+  } catch {
+    // Non-fatal: the gallery works without the name filter.
+  }
 }
 
 function bindLightbox() {
@@ -251,4 +296,5 @@ function bindLightbox() {
 applySiteCopy();
 bindFilters();
 bindLightbox();
+loadGuests();
 load(true);

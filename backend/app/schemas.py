@@ -17,6 +17,7 @@ class UploadedPhoto(BaseModel):
     kind: str = "image"
     thumb_url: str | None = None
     display_url: str | None = None
+    poster_url: str | None = None
 
 
 class UploadResponse(BaseModel):
@@ -36,12 +37,18 @@ class PhotoOut(BaseModel):
     thumb_width: int | None = None
     thumb_height: int | None = None
     display_url: str | None = None
+    poster_url: str | None = None
 
 
 class AdminPhotoOut(PhotoOut):
     client_ip: str = ""
     guest_name: str = ""
     hidden: bool = False
+    pending: bool = False
+
+
+class GuestsResponse(BaseModel):
+    guests: list[str]
 
 
 class PhotoListResponse(BaseModel):
@@ -61,7 +68,9 @@ class AdminListResponse(BaseModel):
 
 
 class PhotoPatchRequest(BaseModel):
-    hidden: bool
+    hidden: bool | None = None
+    # Moderation: approve (pending=False) / reject (pending=True).
+    pending: bool | None = None
 
 
 class DeleteResponse(BaseModel):

@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS photos (
     client_ip TEXT NOT NULL DEFAULT '',
     guest_name TEXT NOT NULL DEFAULT '',
     hidden INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0,
     thumb_width INTEGER,
     thumb_height INTEGER,
     display_width INTEGER,
@@ -45,6 +46,7 @@ class PhotoRepository:
         additions = {
             "hidden": "INTEGER NOT NULL DEFAULT 0",
             "guest_name": "TEXT NOT NULL DEFAULT ''",
+            "pending": "INTEGER NOT NULL DEFAULT 0",
             "thumb_width": "INTEGER",
             "thumb_height": "INTEGER",
             "display_width": "INTEGER",
@@ -63,6 +65,7 @@ class PhotoRepository:
         uploaded_at: str,
         client_ip: str,
         guest_name: str = "",
+        pending: bool = False,
         thumb_width: int | None = None,
         thumb_height: int | None = None,
         display_width: int | None = None,
@@ -74,8 +77,9 @@ class PhotoRepository:
                 """
                 INSERT OR IGNORE INTO photos
                     (object_key, content_type, size_bytes, uploaded_at, client_ip,
-                     guest_name, thumb_width, thumb_height, display_width, display_height)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     guest_name, pending, thumb_width, thumb_height,
+                     display_width, display_height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     object_key,
@@ -84,6 +88,7 @@ class PhotoRepository:
                     uploaded_at,
                     client_ip,
                     guest_name,
+                    1 if pending else 0,
                     thumb_width,
                     thumb_height,
                     display_width,
@@ -142,17 +147,25 @@ class PhotoRepository:
     def _filters(
         self,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> tuple[list[str], list[Any]]:
         where: list[str] = []
         params: list[Any] = []
         if hidden is not None:
             where.append("hidden = ?")
             params.append(1 if hidden else 0)
+        if pending is not None:
+            where.append("pending = ?")
+            params.append(1 if pending else 0)
         if kind == "image":
             where.append("content_type LIKE 'image/%'")
         elif kind == "video":
             where.append("content_type LIKE 'video/%'")
+        if guest:
+            where.append("guest_name = ?")
+            params.append(guest)
         return where, params
 
     async def list_recent(
@@ -160,13 +173,17 @@ class PhotoRepository:
         limit: int = 100,
         offset: int = 0,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> list[dict[str, Any]]:
-        where, params = self._filters(hidden=hidden, kind=kind)
+        where, params = self._filters(
+            hidden=hidden, pending=pending, kind=kind, guest=guest
+        )
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
-                   client_ip, guest_name, hidden, thumb_width, thumb_height,
-                   display_width, display_height
+                   client_ip, guest_name, hidden, pending, thumb_width,
+                   thumb_height, display_width, display_height
             FROM photos
         """
         if where:
@@ -182,9 +199,13 @@ class PhotoRepository:
     async def count(
         self,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> int:
-        where, params = self._filters(hidden=hidden, kind=kind)
+        where, params = self._filters(
+            hidden=hidden, pending=pending, kind=kind, guest=guest
+        )
         sql = "SELECT COUNT(*) AS c FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -193,9 +214,14 @@ class PhotoRepository:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
-    async def list_all(self, kind: str = "all") -> list[dict[str, Any]]:
-        """All rows (no pagination) — used for one-time thumbnail backfill."""
-        where, params = self._filters(kind=kind)
+    async def list_all(
+        self,
+        kind: str = "all",
+        hidden: bool | None = None,
+        pending: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """All rows (no pagination) — used for backfill / maintenance."""
+        where, params = self._filters(kind=kind, hidden=hidden, pending=pending)
         sql = "SELECT id, object_key, content_type FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -204,6 +230,34 @@ class PhotoRepository:
             cursor = await db.execute(sql, params)
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    async def list_guests(self, *, approved_only: bool = False) -> list[str]:
+        """Distinct non-empty guest names, most recent first — for the filter UI."""
+        where = ["guest_name != ''"]
+        params: list[Any] = []
+        if approved_only:
+            where.append("hidden = 0 AND pending = 0")
+        sql = (
+            "SELECT guest_name FROM photos"
+            " WHERE "
+            + " AND ".join(where)
+            + " GROUP BY guest_name"
+            " ORDER BY MAX(uploaded_at) DESC, guest_name COLLATE NOCASE"
+        )
+        async with aiosqlite.connect(self.database_path) as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
+    async def set_pending(self, photo_id: int, pending: bool) -> dict[str, Any] | None:
+        """Approve (pending=False) or reject (pending=True) a moderated upload."""
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                "UPDATE photos SET pending = ? WHERE id = ?",
+                (1 if pending else 0, photo_id),
+            )
+            await db.commit()
+        return await self.get_by_id(photo_id)
 
     async def set_hidden(self, photo_id: int, hidden: bool) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.database_path) as db:

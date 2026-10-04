@@ -12,10 +12,12 @@ from typing import Any, Protocol
 from app.config import CONTENT_TYPE_EXTENSION, Settings, is_image, is_video
 from app.thumbnails import (
     DISPLAY_PREFIX,
+    POSTER_PREFIX,
     THUMB_PREFIX,
     display_key_for,
     generate_display,
     generate_thumbnail,
+    poster_key_for,
     thumb_key_for,
 )
 
@@ -64,7 +66,7 @@ class LocalStorage:
     def absolute_path(self, key: str) -> Path:
         """Resolve key under root; reject traversal outside STORAGE_DIR."""
         prefix = key.split("/", 1)[0] if "/" in key else key
-        allowed = ("uploads", THUMB_PREFIX, DISPLAY_PREFIX)
+        allowed = ("uploads", THUMB_PREFIX, DISPLAY_PREFIX, POSTER_PREFIX)
         if prefix not in allowed or ".." in key or key.count("/") < 2:
             raise ValueError("недопустимый ключ объекта")
         path = (self.root / key).resolve()
@@ -140,6 +142,16 @@ class LocalStorage:
 
     def display_url(self, key: str, base_path: str = "") -> str:
         return self.photo_url(self.display_key(key), base_path)
+
+    def poster_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.poster_key(key), base_path)
+
+    def poster_key(self, key: str) -> str:
+        return poster_key_for(key)
+
+    def save_poster(self, key: str, data: bytes) -> Path | None:
+        """Persist a pre-extracted poster JPEG for a video key."""
+        return self.save_bytes(self.poster_key(key), data)
 
     # Back-compat alias used by older call sites.
     def file_url(self, key: str, base_path: str = "") -> str:
@@ -346,6 +358,16 @@ class YandexStorage:
             logger.warning("Display-версия не создана для %s", key)
             return False
         return self.put_bytes(self.display_key(key), display)
+
+    def poster_key(self, key: str) -> str:
+        return poster_key_for(key)
+
+    def poster_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.poster_key(key), base_path)
+
+    def save_poster(self, key: str, data: bytes) -> bool:
+        """Persist a pre-extracted poster JPEG for a video object."""
+        return self.put_bytes(self.poster_key(key), data)
 
     def delete(self, key: str) -> bool:
         if self.settings.s3_mock:

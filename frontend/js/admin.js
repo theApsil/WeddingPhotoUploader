@@ -21,6 +21,9 @@ const els = {
   adminMore: document.getElementById("admin-more"),
   adminTotal: document.getElementById("admin-total"),
   showHidden: document.getElementById("show-hidden"),
+  pendingOnly: document.getElementById("pending-only"),
+  guestFilter: document.getElementById("admin-guest-filter"),
+  archiveBtn: document.getElementById("archive-btn"),
   logoutBtn: document.getElementById("logout-btn"),
 };
 
@@ -30,6 +33,7 @@ const state = {
   offset: 0,
   total: 0,
   kind: "all",
+  guest: "",
   loading: false,
 };
 
@@ -83,6 +87,45 @@ function renderMore() {
 function rowActions(item, li) {
   const actions = document.createElement("div");
   actions.className = "admin-actions";
+
+  // Moderation: pending uploads get approve / reject controls.
+  if (item.pending) {
+    const approveBtn = document.createElement("button");
+    approveBtn.type = "button";
+    approveBtn.className = "btn btn-small";
+    approveBtn.textContent = "Одобрить";
+    approveBtn.addEventListener("click", async () => {
+      try {
+        const updated = await adminFetch(`/api/admin/photos/${item.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ pending: false }),
+        });
+        item.pending = updated.pending;
+        renderList(false);
+      } catch (err) {
+        showAlert(els.adminAlert, `Не удалось одобрить: ${err.message}`, "error");
+      }
+    });
+    const rejectBtn = document.createElement("button");
+    rejectBtn.type = "button";
+    rejectBtn.className = "btn btn-danger btn-small";
+    rejectBtn.textContent = "Отклонить";
+    rejectBtn.addEventListener("click", async () => {
+      if (!confirm("Скрыть файл от гостей?")) return;
+      try {
+        const updated = await adminFetch(`/api/admin/photos/${item.id}`, {
+          method: "PATCH",
+          body: JSON.stringify({ pending: true, hidden: true }),
+        });
+        item.pending = updated.pending;
+        item.hidden = updated.hidden;
+        renderList(false);
+      } catch (err) {
+        showAlert(els.adminAlert, `Не удалось отклонить: ${err.message}`, "error");
+      }
+    });
+    actions.append(approveBtn, rejectBtn);
+  }
 
   const hideBtn = document.createElement("button");
   hideBtn.type = "button";
@@ -154,6 +197,7 @@ function renderRow(item) {
     `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}` +
     (item.guest_name ? ` · ${item.guest_name}` : "") +
     (item.client_ip ? ` · IP ${item.client_ip}` : "") +
+    (item.pending ? " · на модерации" : "") +
     (item.hidden ? " · скрыто" : "");
   meta.append(name, sub);
 
@@ -182,8 +226,11 @@ async function load(reset = false) {
   renderMore();
   try {
     const hidden = els.showHidden.checked ? "true" : "false";
+    const pending = els.pendingOnly.checked ? "true" : "";
+    const guest = state.guest ? `&guest=${encodeURIComponent(state.guest)}` : "";
     const data = await adminFetch(
-      `/api/admin/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}&hidden=${hidden}`,
+      `/api/admin/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}` +
+        `&hidden=${hidden}${pending ? `&pending=${pending}` : ""}${guest}`,
     );
     state.total = data.total;
     state.items = reset ? data.items : state.items.concat(data.items);
@@ -236,6 +283,7 @@ function showPanel() {
   els.loginCard.hidden = authed;
   els.panel.hidden = !authed;
   if (authed) {
+    loadAdminGuests();
     load(true);
   }
 }
@@ -248,6 +296,17 @@ function bind() {
   els.logoutBtn.addEventListener("click", logout);
   els.adminMore.addEventListener("click", () => load(false));
   els.showHidden.addEventListener("change", () => load(true));
+  els.pendingOnly.addEventListener("change", () => load(true));
+  if (els.guestFilter) {
+    els.guestFilter.addEventListener("change", () => {
+      if (state.loading) return;
+      state.guest = els.guestFilter.value;
+      load(true);
+    });
+  }
+  if (els.archiveBtn) {
+    els.archiveBtn.addEventListener("click", downloadArchive);
+  }
   document.querySelectorAll("#panel .filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
       // Ignore clicks while a request is in flight so the filter isn't lost.
@@ -258,6 +317,46 @@ function bind() {
       load(true);
     });
   });
+}
+
+async function loadAdminGuests() {
+  if (!els.guestFilter) return;
+  try {
+    const data = await adminFetch("/api/admin/photos/guests");
+    els.guestFilter.innerHTML = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "Все гости";
+    els.guestFilter.appendChild(all);
+    (data.guests || []).forEach((name) => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      els.guestFilter.appendChild(opt);
+    });
+  } catch {
+    // non-fatal
+  }
+}
+
+async function downloadArchive() {
+  try {
+    const res = await fetch(`${BASE_PATH}/api/admin/photos/archive.zip`, {
+      headers: { Authorization: `Bearer ${token()}` },
+    });
+    if (!res.ok) throw new Error(`Ошибка ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `wedding-photos-${new Date().toISOString().slice(0, 10)}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    showAlert(els.adminAlert, `Не удалось скачать архив: ${err.message}`, "error");
+  }
 }
 
 applySiteCopy();
