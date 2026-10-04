@@ -40,6 +40,7 @@ class PhotoOut(BaseModel):
 
 class AdminPhotoOut(PhotoOut):
     client_ip: str = ""
+    guest_name: str = ""
     hidden: bool = False
 
 

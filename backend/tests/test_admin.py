@@ -154,6 +154,19 @@ def test_trusted_proxy_ignores_spoofed_leftmost_ip(admin_client):
     assert item["client_ip"] == "9.9.9.9"
 
 
+def test_guest_name_attributed_from_cookie(admin_client):
+    admin_client.cookies.set("guest_name", "Ivan Ivanov")
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == "Ivan Ivanov"
+
+
+def test_no_guest_name_when_cookie_absent(admin_client):
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == ""
+
+
 def test_admin_brute_force_rate_limited(admin_client):
     """Repeated wrong passwords should eventually hit 429."""
     bad = {"Authorization": "Bearer wrong"}

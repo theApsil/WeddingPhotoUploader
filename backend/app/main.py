@@ -193,6 +193,16 @@ def client_ip(request: Request, trusted_proxies: int = 1) -> str:
     return "unknown"
 
 
+_GUEST_NAME_MAX = 80
+
+
+def _guest_name(request: Request) -> str:
+    """Read the remembered guest name from the cookie, sanitized and length-capped."""
+    raw = (request.cookies.get("guest_name") or "").strip()
+    cleaned = "".join(ch for ch in raw if ch.isprintable() and ch not in "\r\n\t")
+    return cleaned[:_GUEST_NAME_MAX]
+
+
 def enforce_rate_limit(request: Request, limiter: RateLimiter, trusted_proxies: int) -> None:
     allowed, _remaining = limiter.allow(client_ip(request, trusted_proxies))
     if not allowed:
@@ -294,6 +304,7 @@ def _build_photo(
     }
     if admin:
         payload["client_ip"] = row.get("client_ip", "")
+        payload["guest_name"] = row.get("guest_name", "")
         payload["hidden"] = bool(row.get("hidden", 0))
     return payload
 
@@ -494,6 +505,7 @@ def _register_routes(api: FastAPI) -> None:
                 size_bytes=len(data),
                 uploaded_at=now,
                 client_ip=ip,
+                guest_name=_guest_name(request),
                 thumb_width=dims[0] if dims else None,
                 thumb_height=dims[1] if dims else None,
                 display_width=dims[0] if dims else None,
@@ -652,6 +664,7 @@ def _register_routes(api: FastAPI) -> None:
                 size_bytes=size_bytes,
                 uploaded_at=now,
                 client_ip=ip,
+                guest_name=_guest_name(request),
                 thumb_width=dims[0] if dims else None,
                 thumb_height=dims[1] if dims else None,
                 display_width=dims[0] if dims else None,

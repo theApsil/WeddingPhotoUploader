@@ -152,6 +152,7 @@ function renderRow(item) {
   sub.className = "sub";
   sub.textContent =
     `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}` +
+    (item.guest_name ? ` · ${item.guest_name}` : "") +
     (item.client_ip ? ` · IP ${item.client_ip}` : "") +
     (item.hidden ? " · скрыто" : "");
   meta.append(name, sub);

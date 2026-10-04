@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS photos (
     size_bytes INTEGER NOT NULL,
     uploaded_at TEXT NOT NULL,
     client_ip TEXT NOT NULL DEFAULT '',
+    guest_name TEXT NOT NULL DEFAULT '',
     hidden INTEGER NOT NULL DEFAULT 0,
     thumb_width INTEGER,
     thumb_height INTEGER,
@@ -43,6 +44,7 @@ class PhotoRepository:
         existing = {row[1] for row in await cursor.fetchall()}
         additions = {
             "hidden": "INTEGER NOT NULL DEFAULT 0",
+            "guest_name": "TEXT NOT NULL DEFAULT ''",
             "thumb_width": "INTEGER",
             "thumb_height": "INTEGER",
             "display_width": "INTEGER",
@@ -60,6 +62,7 @@ class PhotoRepository:
         size_bytes: int,
         uploaded_at: str,
         client_ip: str,
+        guest_name: str = "",
         thumb_width: int | None = None,
         thumb_height: int | None = None,
         display_width: int | None = None,
@@ -71,8 +74,8 @@ class PhotoRepository:
                 """
                 INSERT OR IGNORE INTO photos
                     (object_key, content_type, size_bytes, uploaded_at, client_ip,
-                     thumb_width, thumb_height, display_width, display_height)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     guest_name, thumb_width, thumb_height, display_width, display_height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     object_key,
@@ -80,6 +83,7 @@ class PhotoRepository:
                     size_bytes,
                     uploaded_at,
                     client_ip,
+                    guest_name,
                     thumb_width,
                     thumb_height,
                     display_width,
@@ -161,7 +165,7 @@ class PhotoRepository:
         where, params = self._filters(hidden=hidden, kind=kind)
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
-                   client_ip, hidden, thumb_width, thumb_height,
+                   client_ip, guest_name, hidden, thumb_width, thumb_height,
                    display_width, display_height
             FROM photos
         """

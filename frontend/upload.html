@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1410">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <!-- Optional: <meta name="base-path" content="/wedding"> for non-default prefix -->
+  <title>Данил и Полина — загрузка фото</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="glow glow-1" aria-hidden="true"></div>
+  <div class="glow glow-2" aria-hidden="true"></div>
+
+  <div class="wrap">
+    <header class="hero-mini">
+      <p class="eyebrow">Свадьба</p>
+      <h1 class="names">
+        <span data-site="groom">Данил</span>
+        <span class="amp">&amp;</span>
+        <span data-site="bride">Полина</span>
+      </h1>
+      <p class="date" data-site="dateShort">17 · 10 · 2026</p>
+      <p class="tagline" data-site="tagline">Поделитесь своими снимками с нашего дня</p>
+    </header>
+
+    <nav class="nav" aria-label="Разделы">
+      <a class="nav-link" href="index.html">Главная</a>
+      <a class="nav-link is-active" href="upload.html">Загрузить</a>
+      <a class="nav-link" href="gallery.html">Галерея</a>
+    </nav>
+
+    <section class="card">
+      <div class="guest-banner" id="guest-banner" hidden>
+        <span>Загружаете как:</span>
+        <strong id="guest-name"></strong>
+        <a href="#" id="change-name">Сменить</a>
+      </div>
+
+      <p class="lead">
+        Выберите фото или видео из галереи или снимите камерой.
+        Можно несколько файлов сразу.
+      </p>
+
+      <div class="pick-row">
+        <button type="button" id="pick-gallery" class="btn btn-pick">
+          Из галереи
+        </button>
+        <button type="button" id="pick-camera" class="btn btn-pick btn-outline">
+          Камера
+        </button>
+      </div>
+
+      <div id="dropzone" class="dropzone" role="button" tabindex="0"
+           aria-label="Выбрать файлы">
+        <span class="dz-ornament" aria-hidden="true">✦</span>
+        <strong>Нажмите или перетащите сюда</strong>
+        <span>JPEG, PNG, WebP, HEIC · MP4, WebM, MOV</span>
+      </div>
+      <input id="file-input" class="hidden-input" type="file"
+             accept="image/*,video/*" multiple>
+      <input id="camera-input" class="hidden-input" type="file"
+             accept="image/*,video/*" capture="environment">
+
+      <div class="toolbar">
+        <div id="hints" class="hints"></div>
+      </div>
+
+      <div class="overall" id="overall" hidden>
+        <div class="overall-label">
+          <span>Общий прогресс</span>
+          <span id="overall-text">0%</span>
+        </div>
+        <div class="progress overall-bar"><i id="overall-bar"></i></div>
+      </div>
+
+      <div class="actions">
+        <button type="button" id="clear-btn" class="btn btn-ghost" disabled>
+          Очистить
+        </button>
+        <button type="button" id="upload-btn" class="btn" disabled>
+          Отправить фото
+        </button>
+      </div>
+
+      <div id="alert" class="alert alert-error" hidden></div>
+      <ul id="queue" class="queue"></ul>
+    </section>
+
+    <p class="footer">
+      <span data-site-names>Данил &amp; Полина</span>
+      · <span data-site="dateLabel">17 октября 2026</span>
+      · <a href="admin.html">Админ</a>
+    </p>
+  </div>
+  <script type="module" src="js/upload.js"></script>
+</body>
+</html>

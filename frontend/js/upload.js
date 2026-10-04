@@ -4,9 +4,12 @@ import {
   MAX_SIZE_MB_DEFAULT,
   MAX_VIDEO_SIZE_MB_DEFAULT,
   BASE_PATH,
+  HOME_URL,
   api,
   applySiteCopy,
+  clearGuestName,
   formatBytes,
+  guestName,
   isVideoType,
   showAlert,
 } from "./common.js";
@@ -39,6 +42,9 @@ const els = {
   overall: document.getElementById("overall"),
   overallBar: document.getElementById("overall-bar"),
   overallText: document.getElementById("overall-text"),
+  guestBanner: document.getElementById("guest-banner"),
+  guestName: document.getElementById("guest-name"),
+  changeName: document.getElementById("change-name"),
 };
 
 function syncHints() {
@@ -595,6 +601,21 @@ function bind() {
 
 async function boot() {
   applySiteCopy();
+  // Guest must have entered their name on the home page; otherwise send them back.
+  const name = guestName();
+  if (!name) {
+    window.location.replace(HOME_URL);
+    return;
+  }
+  if (els.guestBanner) {
+    els.guestName.textContent = name;
+    els.guestBanner.hidden = false;
+    els.changeName.addEventListener("click", (e) => {
+      e.preventDefault();
+      clearGuestName();
+      window.location.assign(HOME_URL);
+    });
+  }
   bind();
   syncHints();
   renderQueue();
