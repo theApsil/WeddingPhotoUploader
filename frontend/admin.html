@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1410">
+  <!-- Optional: <meta name="base-path" content="/wedding"> for non-default prefix -->
+  <title>Данил и Полина — админка</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="glow glow-1" aria-hidden="true"></div>
+  <div class="glow glow-2" aria-hidden="true"></div>
+
+  <div class="wrap">
+    <header class="hero-mini">
+      <p class="eyebrow">Свадьба</p>
+      <h1 class="names">
+        <span data-site="groom">Данил</span>
+        <span class="amp">&amp;</span>
+        <span data-site="bride">Полина</span>
+      </h1>
+      <p class="date" data-site="dateShort">17 · 10 · 2026</p>
+      <p class="tagline">Управление фото и видео</p>
+    </header>
+
+    <nav class="nav" aria-label="Разделы">
+      <a class="nav-link" href="index.html">Загрузить</a>
+      <a class="nav-link" href="gallery.html">Галерея</a>
+      <a class="nav-link is-active" href="admin.html">Админ</a>
+    </nav>
+
+    <!-- Login -->
+    <section class="card" id="login-card">
+      <p class="lead">Введите пароль администратора, чтобы управлять галереей.</p>
+      <label class="field">
+        <span class="field-label">Пароль</span>
+        <input id="admin-password" class="input" type="password" autocomplete="current-password" autofocus>
+      </label>
+      <div id="login-alert" class="alert alert-error" hidden></div>
+      <div class="actions actions-single">
+        <button type="button" id="login-btn" class="btn">Войти</button>
+      </div>
+    </section>
+
+    <!-- Panel -->
+    <section class="card" id="panel" hidden>
+      <div class="gallery-head">
+        <div id="admin-total" class="hints">Всего · …</div>
+        <div class="admin-tools">
+          <label class="check">
+            <input type="checkbox" id="show-hidden">
+            <span>Скрытые</span>
+          </label>
+          <button type="button" id="logout-btn" class="btn btn-ghost btn-small">Выйти</button>
+        </div>
+      </div>
+
+      <div class="filters" role="group" aria-label="Фильтр">
+        <button type="button" class="filter-btn is-active" data-kind="all">Все</button>
+        <button type="button" class="filter-btn" data-kind="image">Фото</button>
+        <button type="button" class="filter-btn" data-kind="video">Видео</button>
+      </div>
+
+      <div id="admin-alert" class="alert alert-error" hidden></div>
+      <div id="admin-status" class="loading" hidden>Загружаю…</div>
+      <ul id="admin-list" class="admin-list"></ul>
+      <button type="button" id="admin-more" class="btn btn-ghost load-more" hidden>
+        Показать ещё
+      </button>
+    </section>
+
+    <p class="footer">
+      Управление · <a href="gallery.html">Открыть галерею</a>
+    </p>
+  </div>
+  <script type="module" src="js/admin.js"></script>
+</body>
+</html>

@@ -7,7 +7,7 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-ALLOWED_CONTENT_TYPES = frozenset(
+IMAGE_CONTENT_TYPES = frozenset(
     {
         "image/jpeg",
         "image/png",
@@ -17,13 +17,40 @@ ALLOWED_CONTENT_TYPES = frozenset(
     }
 )
 
+VIDEO_CONTENT_TYPES = frozenset(
+    {
+        "video/mp4",
+        "video/webm",
+        "video/quicktime",  # .mov
+        "video/x-m4v",  # .m4v
+    }
+)
+
+ALLOWED_CONTENT_TYPES = IMAGE_CONTENT_TYPES | VIDEO_CONTENT_TYPES
+
 CONTENT_TYPE_EXTENSION = {
     "image/jpeg": "jpg",
     "image/png": "png",
     "image/webp": "webp",
     "image/heic": "heic",
     "image/heif": "heif",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+    "video/x-m4v": "m4v",
 }
+
+
+def is_image(content_type: str) -> bool:
+    return content_type in IMAGE_CONTENT_TYPES
+
+
+def is_video(content_type: str) -> bool:
+    return content_type in VIDEO_CONTENT_TYPES
+
+
+def kind_of(content_type: str) -> str:
+    return "video" if is_video(content_type) else "image"
 
 StorageBackendName = Literal["local", "yandex"]
 
@@ -59,9 +86,17 @@ class Settings(BaseSettings):
     cors_origins: str = Field(default="", alias="CORS_ORIGINS")
 
     max_file_size_mb: int = Field(default=15, alias="MAX_FILE_SIZE_MB")
-    max_files_per_request: int = Field(default=10, alias="MAX_FILES_PER_REQUEST")
+    max_video_size_mb: int = Field(default=200, alias="MAX_VIDEO_SIZE_MB")
+    # 0 = no per-request file count limit.
+    max_files_per_request: int = Field(default=0, alias="MAX_FILES_PER_REQUEST")
     rate_limit_per_minute: int = Field(default=20, alias="RATE_LIMIT_PER_MINUTE")
     database_path: str = Field(default="./data/photos.db", alias="DATABASE_PATH")
+
+    # Gallery thumbnails (images only; long edge in px).
+    thumbnail_size: int = Field(default=400, alias="THUMBNAIL_SIZE")
+
+    # Admin panel password. Empty = admin endpoints disabled.
+    admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
 
     # Public URL prefix when served behind reverse-proxy (e.g. /wedding).
     base_path: str = Field(default="", alias="BASE_PATH")
@@ -101,6 +136,16 @@ class Settings(BaseSettings):
     @property
     def max_file_size_bytes(self) -> int:
         return self.max_file_size_mb * 1024 * 1024
+
+    @property
+    def max_video_size_bytes(self) -> int:
+        return self.max_video_size_mb * 1024 * 1024
+
+    def size_limit_for(self, content_type: str) -> int:
+        """Bytes allowed for a given content type (video is larger than photos)."""
+        if is_video(content_type):
+            return self.max_video_size_bytes
+        return self.max_file_size_bytes
 
     @property
     def resolved_cors_origins(self) -> list[str]:

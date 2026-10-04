@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS photos (
     content_type TEXT NOT NULL,
     size_bytes INTEGER NOT NULL,
     uploaded_at TEXT NOT NULL,
-    client_ip TEXT NOT NULL DEFAULT ''
+    client_ip TEXT NOT NULL DEFAULT '',
+    hidden INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC);
 """
@@ -29,7 +30,17 @@ class PhotoRepository:
         Path(self.database_path).parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.database_path) as db:
             await db.executescript(SCHEMA)
+            await self._migrate(db)
             await db.commit()
+
+    async def _migrate(self, db: aiosqlite.Connection) -> None:
+        """Add columns introduced after the original schema (idempotent)."""
+        cursor = await db.execute("PRAGMA table_info(photos)")
+        existing = {row[1] for row in await cursor.fetchall()}
+        if "hidden" not in existing:
+            await db.execute(
+                "ALTER TABLE photos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
+            )
 
     async def add(
         self,
@@ -68,26 +79,98 @@ class PhotoRepository:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
-    async def list_recent(self, limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
+    async def get_by_id(self, photo_id: int) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                """
-                SELECT id, object_key, content_type, size_bytes, uploaded_at
-                FROM photos
-                ORDER BY uploaded_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
+                "SELECT * FROM photos WHERE id = ?",
+                (photo_id,),
             )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    def _filters(
+        self,
+        hidden: bool | None = None,
+        kind: str = "all",
+    ) -> tuple[list[str], list[Any]]:
+        where: list[str] = []
+        params: list[Any] = []
+        if hidden is not None:
+            where.append("hidden = ?")
+            params.append(1 if hidden else 0)
+        if kind == "image":
+            where.append("content_type LIKE 'image/%'")
+        elif kind == "video":
+            where.append("content_type LIKE 'video/%'")
+        return where, params
+
+    async def list_recent(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        hidden: bool | None = None,
+        kind: str = "all",
+    ) -> list[dict[str, Any]]:
+        where, params = self._filters(hidden=hidden, kind=kind)
+        sql = """
+            SELECT id, object_key, content_type, size_bytes, uploaded_at,
+                   client_ip, hidden
+            FROM photos
+        """
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY uploaded_at DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        async with aiosqlite.connect(self.database_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(sql, params)
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
 
-    async def count(self) -> int:
+    async def count(
+        self,
+        hidden: bool | None = None,
+        kind: str = "all",
+    ) -> int:
+        where, params = self._filters(hidden=hidden, kind=kind)
+        sql = "SELECT COUNT(*) AS c FROM photos"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
         async with aiosqlite.connect(self.database_path) as db:
-            cursor = await db.execute("SELECT COUNT(*) AS c FROM photos")
+            cursor = await db.execute(sql, params)
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
+
+    async def list_all(self, kind: str = "all") -> list[dict[str, Any]]:
+        """All rows (no pagination) — used for one-time thumbnail backfill."""
+        where, params = self._filters(kind=kind)
+        sql = "SELECT id, object_key, content_type FROM photos"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        async with aiosqlite.connect(self.database_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def set_hidden(self, photo_id: int, hidden: bool) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                "UPDATE photos SET hidden = ? WHERE id = ?",
+                (1 if hidden else 0, photo_id),
+            )
+            await db.commit()
+        return await self.get_by_id(photo_id)
+
+    async def delete(self, photo_id: int) -> dict[str, Any] | None:
+        row = await self.get_by_id(photo_id)
+        if row is None:
+            return None
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+            await db.commit()
+        return row
 
 
 def resolve_db_path(path: str) -> str:

@@ -8,7 +8,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Protocol
 
-from app.config import CONTENT_TYPE_EXTENSION, Settings
+from app.config import CONTENT_TYPE_EXTENSION, Settings, is_image, is_video
+from app.thumbnails import THUMB_PREFIX, generate_thumbnail, thumb_key_for
 
 
 def build_object_key(content_type: str, today: date | None = None) -> str:
@@ -49,7 +50,8 @@ class LocalStorage:
 
     def absolute_path(self, key: str) -> Path:
         """Resolve key under root; reject traversal outside STORAGE_DIR."""
-        if not key.startswith("uploads/") or ".." in key or key.count("/") < 2:
+        prefix = key.split("/", 1)[0] if "/" in key else key
+        if prefix not in ("uploads", THUMB_PREFIX) or ".." in key or key.count("/") < 2:
             raise ValueError("недопустимый ключ объекта")
         path = (self.root / key).resolve()
         try:
@@ -70,9 +72,43 @@ class LocalStorage:
         except ValueError:
             return False
 
+    def delete(self, key: str) -> bool:
+        """Remove the object. Missing files are not an error."""
+        try:
+            path = self.absolute_path(key)
+        except ValueError:
+            return False
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+
+    def thumb_key(self, key: str) -> str:
+        return thumb_key_for(key)
+
+    def save_thumb(self, key: str, data: bytes) -> Path | None:
+        """Generate and persist a JPEG thumbnail for an image key."""
+        if not is_image(self._content_type(key)):
+            return None
+        thumb = generate_thumbnail(data, size=self.settings.thumbnail_size)
+        if not thumb:
+            return None
+        return self.save_bytes(self.thumb_key(key), thumb)
+
+    def _content_type(self, key: str) -> str:
+        ext = key.rsplit(".", 1)[-1].lower()
+        for ct, cext in CONTENT_TYPE_EXTENSION.items():
+            if cext == ext:
+                return ct
+        return "application/octet-stream"
+
     def photo_url(self, key: str, base_path: str = "") -> str:
         prefix = base_path.rstrip("/") if base_path else ""
         return f"{prefix}/api/files/{key}"
+
+    def thumb_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.thumb_key(key), base_path)
 
     # Back-compat alias used by older call sites.
     def file_url(self, key: str, base_path: str = "") -> str:
@@ -129,10 +165,15 @@ class YandexStorage:
     ) -> dict[str, Any]:
         """Return {url, fields} for browser multipart POST directly to the bucket."""
         settings = self.settings
-        max_bytes = settings.max_file_size_bytes
+        max_bytes = settings.size_limit_for(content_type)
         if size_bytes < 1 or size_bytes > max_bytes:
+            limit_mb = (
+                settings.max_video_size_mb
+                if is_video(content_type)
+                else settings.max_file_size_mb
+            )
             raise ValueError(
-                f"размер файла вне диапазона 1…{settings.max_file_size_mb} МБ"
+                f"размер файла вне диапазона 1…{limit_mb} МБ"
             )
 
         client = self._get_client()
@@ -181,6 +222,64 @@ class YandexStorage:
             Params={"Bucket": settings.s3_bucket, "Key": key},
             ExpiresIn=settings.presign_expires_seconds,
         )
+
+    def thumb_key(self, key: str) -> str:
+        return thumb_key_for(key)
+
+    def thumb_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.thumb_key(key), base_path)
+
+    def get_bytes(self, key: str) -> bytes | None:
+        """Download an object's bytes (None in mock mode or on failure)."""
+        if self.settings.s3_mock:
+            return None
+        client = self._get_client()
+        try:
+            resp = client.get_object(Bucket=self.settings.s3_bucket, Key=key)
+            return resp["Body"].read()
+        except Exception:
+            return None
+
+    def put_bytes(self, key: str, data: bytes, content_type: str = "image/jpeg") -> bool:
+        if self.settings.s3_mock:
+            return True
+        client = self._get_client()
+        try:
+            client.put_object(
+                Bucket=self.settings.s3_bucket,
+                Key=key,
+                Body=data,
+                ContentType=content_type,
+            )
+            return True
+        except Exception:
+            return False
+
+    def save_thumb(self, key: str, data: bytes) -> bool:
+        """Generate and store a thumbnail for an image object."""
+        if not is_image(self._content_type(key)):
+            return False
+        thumb = generate_thumbnail(data, size=self.settings.thumbnail_size)
+        if not thumb:
+            return False
+        return self.put_bytes(self.thumb_key(key), thumb)
+
+    def delete(self, key: str) -> bool:
+        if self.settings.s3_mock:
+            return True
+        client = self._get_client()
+        try:
+            client.delete_object(Bucket=self.settings.s3_bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def _content_type(self, key: str) -> str:
+        ext = key.rsplit(".", 1)[-1].lower()
+        for ct, cext in CONTENT_TYPE_EXTENSION.items():
+            if cext == ext:
+                return ct
+        return "application/octet-stream"
 
 
 def create_storage(settings: Settings) -> LocalStorage | YandexStorage:

@@ -2,16 +2,19 @@ import {
   ALLOWED_TYPES,
   MAX_FILES_DEFAULT,
   MAX_SIZE_MB_DEFAULT,
+  MAX_VIDEO_SIZE_MB_DEFAULT,
   BASE_PATH,
   api,
   applySiteCopy,
   formatBytes,
+  isVideoType,
   showAlert,
 } from "./common.js";
 
 const state = {
   files: [],
   maxSizeMb: MAX_SIZE_MB_DEFAULT,
+  maxVideoSizeMb: MAX_VIDEO_SIZE_MB_DEFAULT,
   maxFiles: MAX_FILES_DEFAULT,
   backend: "local",
   busy: false,
@@ -36,9 +39,11 @@ const els = {
 function syncHints() {
   const backendHint =
     state.backend === "yandex" ? "облако Яндекса" : "этот сервер";
+  const countHint =
+    state.maxFiles > 0 ? `до ${state.maxFiles} файлов · ` : "";
   els.hints.textContent =
-    `JPEG, PNG, WebP, HEIC · до ${state.maxSizeMb} МБ · ` +
-    `до ${state.maxFiles} файлов · ${backendHint}`;
+    `Фото до ${state.maxSizeMb} МБ, видео до ${state.maxVideoSizeMb} МБ · ` +
+    `JPEG, PNG, WebP, HEIC, MP4, WebM, MOV · ${countHint}${backendHint}`;
 }
 
 function updateOverall() {
@@ -66,17 +71,20 @@ function updateOverall() {
 
 function validateFile(file) {
   const type = (file.type || "").toLowerCase();
-  // Some phones leave HEIC type empty — allow by extension.
+  // Some phones leave HEIC/HEIF type empty — allow by extension.
   const name = (file.name || "").toLowerCase();
-  const extOk = /\.(jpe?g|png|webp|heic|heif)$/i.test(name);
+  const extOk = /\.(jpe?g|png|webp|heic|heif|mp4|webm|mov|m4v)$/i.test(name);
   if (type && !ALLOWED_TYPES.has(type) && !extOk) {
     return `«${file.name}»: тип не поддерживается (${type || "неизвестно"}).`;
   }
   if (!type && !extOk) {
-    return `«${file.name}»: не похоже на фото. Нужны JPEG, PNG, WebP или HEIC.`;
+    return `«${file.name}»: не похоже на фото или видео. Нужны JPEG, PNG, WebP, HEIC, MP4, WebM или MOV.`;
   }
-  if (file.size > state.maxSizeMb * 1024 * 1024) {
-    return `«${file.name}»: больше ${state.maxSizeMb} МБ. Сожмите снимок или выберите другой.`;
+  const limitMb = isVideoType(guessContentType(file))
+    ? state.maxVideoSizeMb
+    : state.maxSizeMb;
+  if (file.size > limitMb * 1024 * 1024) {
+    return `«${file.name}»: больше ${limitMb} МБ. Выберите файл поменьше.`;
   }
   if (file.size < 1) {
     return `«${file.name}»: пустой файл.`;
@@ -92,6 +100,10 @@ function guessContentType(file) {
   if (name.endsWith(".webp")) return "image/webp";
   if (name.endsWith(".heic")) return "image/heic";
   if (name.endsWith(".heif")) return "image/heif";
+  if (name.endsWith(".mp4")) return "video/mp4";
+  if (name.endsWith(".webm")) return "video/webm";
+  if (name.endsWith(".mov")) return "video/quicktime";
+  if (name.endsWith(".m4v")) return "video/x-m4v";
   return "image/jpeg";
 }
 
@@ -111,7 +123,7 @@ function renderQueue() {
     } else {
       thumb = document.createElement("div");
       thumb.className = "thumb thumb-placeholder";
-      thumb.textContent = "✦";
+      thumb.textContent = item.kind === "video" ? "▶" : "✦";
       thumb.setAttribute("aria-hidden", "true");
     }
 
@@ -165,8 +177,9 @@ function addFiles(fileList) {
   const incoming = Array.from(fileList || []);
   if (!incoming.length) return;
 
-  const room = state.maxFiles - state.files.length;
-  if (room <= 0) {
+  const unlimited = !state.maxFiles || state.maxFiles <= 0;
+  const room = unlimited ? Infinity : state.maxFiles - state.files.length;
+  if (!unlimited && room <= 0) {
     showAlert(
       els.alert,
       `Уже выбрано ${state.maxFiles} файлов — это лимит за один заход.`,
@@ -175,8 +188,8 @@ function addFiles(fileList) {
     return;
   }
 
-  const slice = incoming.slice(0, room);
-  if (incoming.length > room) {
+  const slice = unlimited ? incoming : incoming.slice(0, room);
+  if (!unlimited && incoming.length > room) {
     showAlert(
       els.alert,
       `Добавлены только первые ${room} файл(ов) — лимит ${state.maxFiles}.`,
@@ -187,16 +200,17 @@ function addFiles(fileList) {
   for (const file of slice) {
     const err = validateFile(file);
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const type = guessContentType(file);
     const item = {
       id,
       file,
+      kind: isVideoType(type) ? "video" : "image",
       preview: "",
       progress: 0,
       done: false,
       error: err,
     };
-    const type = guessContentType(file);
-    if (!err && type !== "image/heic" && type !== "image/heif") {
+    if (!err && item.kind === "image" && type !== "image/heic" && type !== "image/heif") {
       try {
         item.preview = URL.createObjectURL(file);
       } catch {
@@ -449,7 +463,8 @@ async function boot() {
   try {
     const health = await api("/api/health");
     if (health.max_file_size_mb) state.maxSizeMb = health.max_file_size_mb;
-    if (health.max_files_per_request) state.maxFiles = health.max_files_per_request;
+    if (health.max_video_size_mb) state.maxVideoSizeMb = health.max_video_size_mb;
+    if (health.max_files_per_request != null) state.maxFiles = health.max_files_per_request;
     if (health.storage_backend) state.backend = health.storage_backend;
     syncHints();
     if (!health.storage_configured) {

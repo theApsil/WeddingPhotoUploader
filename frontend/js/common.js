@@ -1,6 +1,6 @@
 /* Shared helpers for upload and gallery pages. */
 
-export const ALLOWED_TYPES = new Set([
+export const IMAGE_TYPES = new Set([
   "image/jpeg",
   "image/png",
   "image/webp",
@@ -8,8 +8,23 @@ export const ALLOWED_TYPES = new Set([
   "image/heif",
 ]);
 
+export const VIDEO_TYPES = new Set([
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-m4v",
+]);
+
+export const ALLOWED_TYPES = new Set([...IMAGE_TYPES, ...VIDEO_TYPES]);
+
 export const MAX_SIZE_MB_DEFAULT = 15;
-export const MAX_FILES_DEFAULT = 10;
+export const MAX_VIDEO_SIZE_MB_DEFAULT = 200;
+// 0 = no per-request file count limit.
+export const MAX_FILES_DEFAULT = 0;
+
+export function isVideoType(type) {
+  return VIDEO_TYPES.has((type || "").toLowerCase());
+}
 
 /** Editable wedding copy — change names/date here and in HTML titles. */
 export const SITE = {

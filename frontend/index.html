@@ -33,7 +33,7 @@
 
     <section class="card">
       <p class="lead">
-        Выберите фото из галереи или сделайте снимок камерой.
+        Выберите фото или видео из галереи или снимите камерой.
         Можно несколько файлов сразу — авторизация не нужна.
       </p>
 
@@ -50,12 +50,12 @@
            aria-label="Выбрать файлы">
         <span class="dz-ornament" aria-hidden="true">✦</span>
         <strong>Нажмите или перетащите сюда</strong>
-        <span>JPEG, PNG, WebP, HEIC</span>
+        <span>JPEG, PNG, WebP, HEIC · MP4, WebM, MOV</span>
       </div>
       <input id="file-input" class="hidden-input" type="file"
-             accept="image/*" multiple>
+             accept="image/*,video/*" multiple>
       <input id="camera-input" class="hidden-input" type="file"
-             accept="image/*" capture="environment">
+             accept="image/*,video/*" capture="environment">
 
       <div class="toolbar">
         <div id="hints" class="hints"></div>
@@ -85,6 +85,7 @@
     <p class="footer">
       Без авторизации · <span data-site-names>Данил &amp; Полина</span>
       · <span data-site="dateLabel">17 октября 2026</span>
+      · <a href="admin.html">Админ</a>
     </p>
   </div>
   <script type="module" src="js/upload.js"></script>

@@ -27,3 +27,7 @@ data/uploads/
 *.key
 credentials.json
 .secrets/
+
+# IDE / agent tooling
+.idea/
+.nessy/

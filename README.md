@@ -148,21 +148,33 @@ aws --endpoint-url=https://storage.yandexcloud.net \
 ## API
 
 | Метод | Когда |
-|-------|--------|
-| `GET /api/health` | всегда — `storage_backend`, лимиты |
-| `POST /api/uploads` | local — multipart `files` |
-| `GET /api/files/{key}` | local — отдать файл |
+|--------|-------|
+| `GET /api/health` | всегда — `storage_backend`, лимиты, `admin_enabled` |
+| `POST /api/uploads` | local — multipart `files` (фото + видео) |
+| `GET /api/files/{key}` | local — отдать файл (также превью `thumbs/…`) |
 | `POST /api/uploads/presign` | yandex — policy для браузера |
-| `POST /api/uploads/confirm` | yandex — запись в SQLite |
-| `GET /api/photos` | всегда — галерея |
+| `POST /api/uploads/confirm` | yandex — запись в SQLite + генерация превью |
+| `GET /api/photos` | всегда — галерея (`limit`, `offset`, `kind=all\|image\|video`, только видимые) |
+| `GET /api/admin/photos` | админка — список (вкл. скрытые, `hidden=true`) |
+| `PATCH /api/admin/photos/{id}` | админка — скрыть/показать (`{"hidden": bool}`) |
+| `DELETE /api/admin/photos/{id}` | админка — удалить файл + превью + запись |
+
+- **Превью** генерируются сервером (Pillow, JPEG, `THUMBNAIL_SIZE` по умолчанию 400px)
+  и отдаются в галерее вместо оригиналов — страница не скачивает все фото целиком.
+  Полный файл открывается только по клику в лайтбоксе.
+- **Видео** (mp4/webm/mov/m4v) имеют отдельный лимит `MAX_VIDEO_SIZE_MB` (200 по
+  умолчанию); в галерее показываются без скачивания, проигрываются в лайтбоксе.
+- **Лимит файлов** `MAX_FILES_PER_REQUEST=0` означает «без лимита за заход».
+- **Админка** на `/admin.html`: требует `ADMIN_PASSWORD` (Bearer-токен), позволяет
+  скрывать и удалять файлы.
 
 ## Защита без авторизации
 
 | Мера | Где |
 |------|-----|
-| jpeg/png/webp/heic | клиент + API (+ policy в yandex) |
-| размер ≤ 15 МБ | клиент + API |
-| лимит файлов за заход | клиент + API |
+| jpeg/png/webp/heic + mp4/webm/mov/m4v | клиент + API (+ policy в yandex) |
+| фото ≤ 15 МБ, видео ≤ 200 МБ | клиент + API |
+| лимит файлов за заход (опционально) | клиент + API (`MAX_FILES_PER_REQUEST`, 0 = нет) |
 | rate limit по IP | API (`X-Forwarded-For`) |
 | случайные ключи | API |
 | path traversal | local resolve под `STORAGE_DIR` |
