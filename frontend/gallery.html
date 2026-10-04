@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1410">
+  <!-- Optional: <meta name="base-path" content="/wedding"> for non-default prefix -->
+  <title>Данил и Полина — галерея</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="glow glow-1" aria-hidden="true"></div>
+  <div class="glow glow-2" aria-hidden="true"></div>
+
+  <div class="wrap">
+    <header class="hero-mini">
+      <p class="eyebrow">Свадьба</p>
+      <h1 class="names">
+        <span data-site="groom">Данил</span>
+        <span class="amp">&amp;</span>
+        <span data-site="bride">Полина</span>
+      </h1>
+      <p class="date" data-site="dateShort">17 · 10 · 2026</p>
+      <p class="tagline">Общая галерея гостей</p>
+    </header>
+
+    <nav class="nav" aria-label="Разделы">
+      <a class="nav-link" href="index.html">Загрузить</a>
+      <a class="nav-link is-active" href="gallery.html">Галерея</a>
+    </nav>
+
+    <section class="card">
+      <div id="total" class="hints">Всего · …</div>
+      <div id="alert" class="alert alert-error" hidden></div>
+      <div id="status" class="loading">Загружаю…</div>
+      <div id="gallery" class="gallery"></div>
+    </section>
+
+    <p class="footer">
+      Данные: API /api/photos · обновляется при открытии страницы
+    </p>
+  </div>
+  <script type="module" src="js/gallery.js"></script>
+</body>
+</html>

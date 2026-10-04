@@ -1,0 +1,11 @@
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://SITE_DOMAIN"],
+      "AllowedMethods": ["GET", "HEAD", "POST"],
+      "AllowedHeaders": ["*"],
+      "ExposeHeaders": ["ETag", "Location"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}

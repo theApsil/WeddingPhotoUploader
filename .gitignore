@@ -1,0 +1,29 @@
+.env
+*.pyc
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+node_modules/
+data/*.db
+data/*.sqlite
+*.egg-info/
+dist/
+build/
+.DS_Store
+certbot/
+letsencrypt/
+nginx/certs/
+*.log
+.coverage
+htmlcov/
+
+# Uploaded photos (local storage)
+data/uploads/
+
+# Secrets / local overrides
+*.pem
+*.key
+credentials.json
+.secrets/

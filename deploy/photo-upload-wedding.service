@@ -1,0 +1,15 @@
+[Unit]
+Description=Photo Upload (wedding) on /wedding
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/pulse_demo_data/files/photo-upload/backend
+EnvironmentFile=/root/pulse_demo_data/files/photo-upload/.env
+ExecStart=/root/pulse_demo_data/files/photo-upload/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8200
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

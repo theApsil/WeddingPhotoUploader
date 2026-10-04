@@ -1,0 +1,50 @@
+services:
+  api:
+    build: ./backend
+    env_file:
+      - .env
+    environment:
+      DATABASE_PATH: /data/photos.db
+      STORAGE_DIR: /data
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      # Compose web sits at site root; override host .env BASE_PATH=/wedding if present.
+      BASE_PATH: ""
+    volumes:
+      - photo_data:/data
+    restart: unless-stopped
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  web:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+      - certbot_www:/var/www/certbot:ro
+    restart: unless-stopped
+
+  # Optional: obtain/renew certificates after DNS points to this host.
+  # docker compose run --rm certbot certonly --webroot -w /var/www/certbot \
+  #   -d ${SITE_DOMAIN} --email ${LETSENCRYPT_EMAIL} --agree-tos --no-eff-email
+  certbot:
+    image: certbot/certbot:v2.11.0
+    volumes:
+      - ./nginx/certs:/etc/letsencrypt
+      - certbot_www:/var/www/certbot
+    profiles: ["certs"]
+    entrypoint: certbot
+
+volumes:
+  photo_data:
+  certbot_www:

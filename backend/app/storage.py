@@ -1,0 +1,189 @@
+"""Storage backends: local filesystem and Yandex Object Storage (S3 API)."""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import date
+from pathlib import Path
+from typing import Any, Protocol
+
+from app.config import CONTENT_TYPE_EXTENSION, Settings
+
+
+def build_object_key(content_type: str, today: date | None = None) -> str:
+    """Random UUID key under a date prefix; never use the original filename."""
+    day = today or date.today()
+    ext = CONTENT_TYPE_EXTENSION.get(content_type, "bin")
+    return f"uploads/{day.isoformat()}/{uuid.uuid4().hex}.{ext}"
+
+
+class StorageBackend(Protocol):
+    """Common surface used by the API layer."""
+
+    def ensure_ready(self) -> None: ...
+
+    def is_ready(self) -> bool: ...
+
+    def photo_url(self, key: str, base_path: str = "") -> str: ...
+
+
+class LocalStorage:
+    """Files live under STORAGE_DIR with keys like uploads/YYYY-MM-DD/<uuid>.ext."""
+
+    name = "local"
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.root = Path(settings.storage_dir).expanduser().resolve()
+
+    def ensure_ready(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def is_ready(self) -> bool:
+        try:
+            self.ensure_ready()
+            return self.root.is_dir() and os.access(self.root, os.W_OK)
+        except OSError:
+            return False
+
+    def absolute_path(self, key: str) -> Path:
+        """Resolve key under root; reject traversal outside STORAGE_DIR."""
+        if not key.startswith("uploads/") or ".." in key or key.count("/") < 2:
+            raise ValueError("недопустимый ключ объекта")
+        path = (self.root / key).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError as exc:
+            raise ValueError("недопустимый путь") from exc
+        return path
+
+    def save_bytes(self, key: str, data: bytes) -> Path:
+        path = self.absolute_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return path
+
+    def exists(self, key: str) -> bool:
+        try:
+            return self.absolute_path(key).is_file()
+        except ValueError:
+            return False
+
+    def photo_url(self, key: str, base_path: str = "") -> str:
+        prefix = base_path.rstrip("/") if base_path else ""
+        return f"{prefix}/api/files/{key}"
+
+    # Back-compat alias used by older call sites.
+    def file_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(key, base_path)
+
+
+class YandexStorage:
+    """Presigned POST into Yandex Object Storage; gallery via signed GET or public URL."""
+
+    name = "yandex"
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._client = None
+
+    def ensure_ready(self) -> None:
+        # Client is created lazily; mock mode needs no network.
+        if self.settings.s3_mock:
+            return
+        if not self.settings.yandex_keys_present:
+            return
+        self._get_client()
+
+    def is_ready(self) -> bool:
+        if self.settings.s3_mock:
+            return True
+        return self.settings.yandex_keys_present
+
+    def _get_client(self):  # noqa: ANN202 — boto3 client type is dynamic
+        if self._client is not None:
+            return self._client
+        import boto3
+        from botocore.client import Config
+
+        key_id = self.settings.yandex_access_key_id or "mock-access-key"
+        secret = self.settings.yandex_secret_access_key or "mock-secret-key"
+        endpoint = self.settings.s3_endpoint.strip() or None
+        self._client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=self.settings.s3_region,
+            aws_access_key_id=key_id,
+            aws_secret_access_key=secret,
+            config=Config(signature_version="s3v4"),
+        )
+        return self._client
+
+    def create_presigned_post(
+        self,
+        *,
+        key: str,
+        content_type: str,
+        size_bytes: int,
+    ) -> dict[str, Any]:
+        """Return {url, fields} for browser multipart POST directly to the bucket."""
+        settings = self.settings
+        max_bytes = settings.max_file_size_bytes
+        if size_bytes < 1 or size_bytes > max_bytes:
+            raise ValueError(
+                f"размер файла вне диапазона 1…{settings.max_file_size_mb} МБ"
+            )
+
+        client = self._get_client()
+        conditions: list[Any] = [
+            {"bucket": settings.s3_bucket},
+            {"key": key},
+            {"Content-Type": content_type},
+            ["content-length-range", 1, max_bytes],
+        ]
+        fields = {
+            "key": key,
+            "Content-Type": content_type,
+        }
+        result = client.generate_presigned_post(
+            Bucket=settings.s3_bucket,
+            Key=key,
+            Fields=fields,
+            Conditions=conditions,
+            ExpiresIn=settings.presign_expires_seconds,
+        )
+        return {"url": result["url"], "fields": result["fields"]}
+
+    def object_exists(self, key: str) -> bool:
+        if self.settings.s3_mock:
+            # In mock mode confirm trusts the client after a successful "upload" stub.
+            return True
+        client = self._get_client()
+        try:
+            client.head_object(Bucket=self.settings.s3_bucket, Key=key)
+            return True
+        except Exception:
+            return False
+
+    def photo_url(self, key: str, base_path: str = "") -> str:
+        settings = self.settings
+        if settings.public_read:
+            host = settings.storage_domain or f"{settings.s3_bucket}.storage.yandexcloud.net"
+            return f"https://{host}/{key}"
+        if settings.s3_mock:
+            # Stable placeholder for tests / local UI without cloud.
+            prefix = base_path.rstrip("/") if base_path else ""
+            return f"{prefix}/api/files/{key}"
+        client = self._get_client()
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": settings.s3_bucket, "Key": key},
+            ExpiresIn=settings.presign_expires_seconds,
+        )
+
+
+def create_storage(settings: Settings) -> LocalStorage | YandexStorage:
+    if settings.is_yandex:
+        return YandexStorage(settings)
+    return LocalStorage(settings)
