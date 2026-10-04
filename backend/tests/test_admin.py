@@ -128,3 +128,35 @@ def test_admin_delete_removes_file_and_db(admin_client, env_local):
 def test_admin_delete_requires_auth(admin_client):
     res = admin_client.delete("/api/admin/photos/1")
     assert res.status_code == 401
+
+
+def test_hidden_original_not_served_by_direct_link(admin_client):
+    """Hiding must remove direct-link access to the local original."""
+    saved = _upload(admin_client)
+    url = saved["url"]
+    assert admin_client.get(url).status_code == 200
+
+    listing = admin_client.get("/api/admin/photos", headers=_auth()).json()
+    photo_id = listing["items"][0]["id"]
+    admin_client.patch(
+        f"/api/admin/photos/{photo_id}", json={"hidden": True}, headers=_auth()
+    )
+
+    # Original is now withheld; the derived (EXIF-free) display still works.
+    assert admin_client.get(url).status_code == 404
+    assert admin_client.get(saved["display_url"]).status_code == 200
+
+
+def test_trusted_proxy_ignores_spoofed_leftmost_ip(admin_client):
+    """X-Forwarded-For spoofing must not override the real (rightmost) IP."""
+    _upload(admin_client, headers={"X-Forwarded-For": "1.2.3.4, 9.9.9.9"})
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["client_ip"] == "9.9.9.9"
+
+
+def test_admin_brute_force_rate_limited(admin_client):
+    """Repeated wrong passwords should eventually hit 429."""
+    bad = {"Authorization": "Bearer wrong"}
+    statuses = {admin_client.get("/api/admin/photos", headers=bad).status_code for _ in range(15)}
+    assert 401 in statuses
+    assert 429 in statuses

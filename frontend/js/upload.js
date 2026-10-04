@@ -20,6 +20,11 @@ const state = {
   busy: false,
 };
 
+// Batch several files per request so guests on one network don't blow the
+// per-minute rate limit, and run a few batches concurrently for throughput.
+const BATCH_SIZE = 6;
+const PARALLEL_BATCHES = 2;
+
 const els = {
   zone: document.getElementById("dropzone"),
   input: document.getElementById("file-input"),
@@ -275,6 +280,48 @@ function uploadViaXhrLocal(file, onProgress) {
   });
 }
 
+function uploadBatchLocal(batch) {
+  /* One multipart POST for the whole batch (far fewer requests = fewer 429s). */
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    batch.forEach((item) => form.append("files", item.file, item.file.name));
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${BASE_PATH}/api/uploads`);
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable) {
+        const pct = Math.round((ev.loaded / ev.total) * 100);
+        batch.forEach((item) => {
+          item.progress = pct;
+        });
+        renderQueue();
+      }
+    };
+    xhr.onload = () => {
+      let data = null;
+      try {
+        data = xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch {
+        data = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+        return;
+      }
+      const detail = data?.detail;
+      const message = Array.isArray(detail)
+        ? detail.map((x) => x.msg || JSON.stringify(x)).join("; ")
+        : detail || `Сервер ответил ${xhr.status}`;
+      const err = new Error(message);
+      err.status = xhr.status;
+      reject(err);
+    };
+    xhr.onerror = () =>
+      reject(new Error("Сеть оборвалась. Проверьте связь и попробуйте снова."));
+    xhr.send(form);
+  });
+}
+
 function postToObjectStorage(uploadUrl, fields, file, onProgress) {
   return new Promise((resolve, reject) => {
     const form = new FormData();
@@ -345,6 +392,41 @@ async function uploadOneYandex(item) {
   });
 }
 
+async function uploadBatchYandex(batch) {
+  /* One presign + one confirm per batch; object uploads go straight to the bucket. */
+  const contentTypes = batch.map((item) => guessContentType(item.file));
+  const presign = await api("/api/uploads/presign", {
+    method: "POST",
+    body: JSON.stringify({
+      files: batch.map((item, i) => ({
+        content_type: contentTypes[i],
+        size: item.file.size,
+      })),
+    }),
+  });
+  const slots = presign.items;
+
+  await Promise.all(
+    slots.map((slot, i) =>
+      postToObjectStorage(slot.upload_url, slot.fields, batch[i].file, (pct) => {
+        batch[i].progress = Math.max(5, Math.min(95, pct));
+        renderQueue();
+      }),
+    ),
+  );
+
+  await api("/api/uploads/confirm", {
+    method: "POST",
+    body: JSON.stringify({
+      files: slots.map((slot, i) => ({
+        key: slot.key,
+        content_type: contentTypes[i],
+        size_bytes: batch[i].file.size,
+      })),
+    }),
+  });
+}
+
 async function uploadOne(item) {
   item.error = null;
   item.progress = 0;
@@ -371,6 +453,45 @@ async function uploadOne(item) {
   item.done = true;
 }
 
+function runBatches(batches) {
+  /* Process batches with up to PARALLEL_BATCHES in flight. Returns okCount. */
+  let okCount = 0;
+  const worker = async (idx) => {
+    while (idx < batches.length) {
+      const batch = batches[idx];
+      batch.forEach((item) => {
+        item.error = null;
+        item.progress = 0;
+      });
+      renderQueue();
+      try {
+        if (state.backend === "yandex") {
+          await uploadBatchYandex(batch);
+        } else {
+          await uploadBatchLocal(batch);
+        }
+        batch.forEach((item) => {
+          item.progress = 100;
+          item.done = true;
+        });
+        okCount += batch.length;
+      } catch (err) {
+        const message = err.message || "Ошибка загрузки";
+        batch.forEach((item) => {
+          item.error = message;
+          item.progress = 0;
+          if (err.status === 400) item.invalid = true;
+        });
+      }
+      renderQueue();
+      idx += PARALLEL_BATCHES;
+    }
+  };
+  return Promise.all(
+    Array.from({ length: Math.min(PARALLEL_BATCHES, batches.length) }, (_, i) => worker(i)),
+  ).then(() => okCount);
+}
+
 async function startUpload() {
   if (state.busy) return;
   const pending = state.files.filter((f) => !f.done && !f.error);
@@ -383,19 +504,13 @@ async function startUpload() {
   renderQueue();
   showAlert(els.alert, "", "error");
 
-  let okCount = 0;
-  try {
-    for (const item of pending) {
-      try {
-        await uploadOne(item);
-        okCount += 1;
-      } catch (err) {
-        item.error = err.message || "Ошибка загрузки";
-        item.progress = 0;
-      }
-      renderQueue();
-    }
+  const batches = [];
+  for (let i = 0; i < pending.length; i += BATCH_SIZE) {
+    batches.push(pending.slice(i, i + BATCH_SIZE));
+  }
 
+  try {
+    const okCount = await runBatches(batches);
     if (okCount) {
       showAlert(
         els.alert,

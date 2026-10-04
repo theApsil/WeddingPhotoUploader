@@ -16,9 +16,13 @@ CREATE TABLE IF NOT EXISTS photos (
     size_bytes INTEGER NOT NULL,
     uploaded_at TEXT NOT NULL,
     client_ip TEXT NOT NULL DEFAULT '',
-    hidden INTEGER NOT NULL DEFAULT 0
+    hidden INTEGER NOT NULL DEFAULT 0,
+    thumb_width INTEGER,
+    thumb_height INTEGER,
+    display_width INTEGER,
+    display_height INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC, id DESC);
 """
 
 
@@ -37,10 +41,16 @@ class PhotoRepository:
         """Add columns introduced after the original schema (idempotent)."""
         cursor = await db.execute("PRAGMA table_info(photos)")
         existing = {row[1] for row in await cursor.fetchall()}
-        if "hidden" not in existing:
-            await db.execute(
-                "ALTER TABLE photos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
-            )
+        additions = {
+            "hidden": "INTEGER NOT NULL DEFAULT 0",
+            "thumb_width": "INTEGER",
+            "thumb_height": "INTEGER",
+            "display_width": "INTEGER",
+            "display_height": "INTEGER",
+        }
+        for name, decl in additions.items():
+            if name not in existing:
+                await db.execute(f"ALTER TABLE photos ADD COLUMN {name} {decl}")
 
     async def add(
         self,
@@ -50,16 +60,31 @@ class PhotoRepository:
         size_bytes: int,
         uploaded_at: str,
         client_ip: str,
+        thumb_width: int | None = None,
+        thumb_height: int | None = None,
+        display_width: int | None = None,
+        display_height: int | None = None,
     ) -> dict[str, Any]:
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute(
                 """
                 INSERT OR IGNORE INTO photos
-                    (object_key, content_type, size_bytes, uploaded_at, client_ip)
-                VALUES (?, ?, ?, ?, ?)
+                    (object_key, content_type, size_bytes, uploaded_at, client_ip,
+                     thumb_width, thumb_height, display_width, display_height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (object_key, content_type, size_bytes, uploaded_at, client_ip),
+                (
+                    object_key,
+                    content_type,
+                    size_bytes,
+                    uploaded_at,
+                    client_ip,
+                    thumb_width,
+                    thumb_height,
+                    display_width,
+                    display_height,
+                ),
             )
             await db.commit()
             cursor = await db.execute(
@@ -68,6 +93,27 @@ class PhotoRepository:
             )
             row = await cursor.fetchone()
             return dict(row) if row else {}
+
+    async def update_dimensions(
+        self,
+        photo_id: int,
+        *,
+        thumb_width: int | None,
+        thumb_height: int | None,
+        display_width: int | None,
+        display_height: int | None,
+    ) -> None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                """
+                UPDATE photos
+                SET thumb_width = ?, thumb_height = ?,
+                    display_width = ?, display_height = ?
+                WHERE id = ?
+                """,
+                (thumb_width, thumb_height, display_width, display_height, photo_id),
+            )
+            await db.commit()
 
     async def get_by_key(self, object_key: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.database_path) as db:
@@ -115,12 +161,13 @@ class PhotoRepository:
         where, params = self._filters(hidden=hidden, kind=kind)
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
-                   client_ip, hidden
+                   client_ip, hidden, thumb_width, thumb_height,
+                   display_width, display_height
             FROM photos
         """
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY uploaded_at DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY uploaded_at DESC, id DESC LIMIT ? OFFSET ?"
         params += [limit, offset]
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row

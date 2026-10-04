@@ -19,6 +19,7 @@ const state = {
   kind: "all",
   loading: false,
   current: -1,
+  hasMore: false,
 };
 
 function setStatus(message, cls = "loading") {
@@ -51,7 +52,18 @@ function makeTile(item, index) {
     img.loading = "lazy";
     img.decoding = "async";
     img.alt = "Фото со свадьбы";
-    img.src = item.thumb_url || item.url;
+    // Fall back to display/original if a preview is missing (e.g. old data).
+    const fallbacks = [item.thumb_url, item.display_url, item.url].filter(Boolean);
+    img.src = fallbacks[0] || "";
+    let fi = 1;
+    img.onerror = () => {
+      if (fi < fallbacks.length) {
+        img.src = fallbacks[fi++];
+      } else {
+        tile.classList.add("tile-broken");
+        img.remove();
+      }
+    };
     tile.appendChild(img);
   }
 
@@ -105,6 +117,7 @@ async function load(reset = false) {
       `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}`,
     );
     state.total = data.total;
+    state.hasMore = data.has_more;
     state.items = reset ? data.items : state.items.concat(data.items);
     state.offset = state.items.length;
 
@@ -153,11 +166,21 @@ function renderStage() {
     video.src = item.url;
     els.lbStage.appendChild(video);
   } else {
+    // Show the EXIF-free display JPEG (works for HEIC everywhere, lighter);
+    // fall back to the original when no display version exists.
     const img = document.createElement("img");
-    img.src = item.url;
+    img.src = item.display_url || item.url;
     img.alt = "Фото со свадьбы";
     els.lbStage.appendChild(img);
   }
+  const download = document.createElement("a");
+  download.className = "lb-download";
+  download.href = item.url;
+  download.download = "";
+  download.textContent = "Скачать";
+  download.target = "_blank";
+  download.rel = "noopener noreferrer";
+  els.lbStage.appendChild(download);
   els.lbMeta.textContent =
     `${state.current + 1} / ${state.items.length} · ` +
     `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}`;
@@ -180,15 +203,27 @@ function closeLightbox() {
   state.current = -1;
 }
 
-function step(delta) {
+async function step(delta) {
   if (state.current < 0 || !state.items.length) return;
-  state.current = (state.current + delta + state.items.length) % state.items.length;
+  let next = state.current + delta;
+  if (delta > 0 && next >= state.items.length) {
+    // Load the next page so the lightbox can keep navigating forward.
+    if (state.hasMore && !state.loading) {
+      await load(false);
+    }
+    next = Math.min(next, state.items.length - 1);
+  } else if (delta < 0 && next < 0) {
+    next = state.items.length - 1;
+  }
+  state.current = next;
   renderStage();
 }
 
 function bindFilters() {
   document.querySelectorAll(".filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // Ignore clicks while a request is in flight so the filter isn't lost.
+      if (state.loading) return;
       document.querySelectorAll(".filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;

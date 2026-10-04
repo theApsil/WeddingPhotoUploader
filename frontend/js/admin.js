@@ -112,6 +112,9 @@ function rowActions(item, li) {
       await adminFetch(`/api/admin/photos/${item.id}`, { method: "DELETE" });
       state.items = state.items.filter((it) => it.id !== item.id);
       state.total = Math.max(0, state.total - 1);
+      // Recompute offset from what's actually shown so "Показать ещё"
+      // doesn't skip the row that shifted into the deleted item's place.
+      state.offset = state.items.length;
       renderList(false);
       showAlert(els.adminAlert, "", "error");
     } catch (err) {
@@ -246,6 +249,8 @@ function bind() {
   els.showHidden.addEventListener("change", () => load(true));
   document.querySelectorAll("#panel .filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // Ignore clicks while a request is in flight so the filter isn't lost.
+      if (state.loading) return;
       document.querySelectorAll("#panel .filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;

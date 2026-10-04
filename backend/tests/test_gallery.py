@@ -93,6 +93,31 @@ def test_pagination(client):
     assert page3["has_more"] is False
 
 
+def test_display_version_served(client):
+    saved = client.post(
+        "/api/uploads",
+        files=[("files", ("a.jpg", TINY_JPEG, "image/jpeg"))],
+    ).json()["saved"][0]
+    assert saved["display_url"]
+    assert saved["display_url"].startswith("/api/files/display/")
+
+    res = client.get(saved["display_url"])
+    assert res.status_code == 200
+    assert "image/jpeg" in res.headers.get("content-type", "")
+
+
+def test_gallery_excludes_hidden_and_includes_dimensions(client):
+    """Dimensions are stored in DB so Yandex tiles are not square/cropped."""
+    client.post(
+        "/api/uploads",
+        files=[("files", ("a.jpg", TINY_JPEG, "image/jpeg"))],
+    )
+    item = client.get("/api/photos").json()["items"][0]
+    assert item["thumb_width"] == 1
+    assert item["thumb_height"] == 1
+    assert item["display_url"]
+
+
 def test_video_upload_kind_and_filter(client):
     upload = client.post(
         "/api/uploads",
@@ -160,6 +185,7 @@ def test_startup_backfill_generates_missing_thumbs(env_local):
     )
     assert not storage.exists(storage.thumb_key(key))
 
-    asyncio.run(main._backfill_thumbnails(repo, storage))
+    asyncio.run(main._backfill_derived(repo, storage))
 
     assert storage.exists(storage.thumb_key(key))
+    assert storage.exists(storage.display_key(key))

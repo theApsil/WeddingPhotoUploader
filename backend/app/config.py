@@ -95,6 +95,19 @@ class Settings(BaseSettings):
     # Gallery thumbnails (images only; long edge in px).
     thumbnail_size: int = Field(default=400, alias="THUMBNAIL_SIZE")
 
+    # Display-size JPEG (EXIF stripped) served in the lightbox instead of the
+    # original — opens HEIC everywhere and keeps guests from downloading full
+    # originals. Long edge in px.
+    display_size: int = Field(default=1920, alias="DISPLAY_SIZE")
+
+    # Number of trusted reverse proxies in front of the app. Used to pick the
+    # real client IP from X-Forwarded-For (from the right), ignoring spoofed
+    # leftmost entries. 1 = nginx/Caddy directly in front.
+    trusted_proxies: int = Field(default=1, alias="TRUSTED_PROXIES")
+
+    # Strip EXIF/GPS from stored originals (local) and display JPEGs.
+    strip_exif: bool = Field(default=True, alias="STRIP_EXIF")
+
     # Admin panel password. Empty = admin endpoints disabled.
     admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
 

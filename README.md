@@ -175,7 +175,10 @@ aws --endpoint-url=https://storage.yandexcloud.net \
 | jpeg/png/webp/heic + mp4/webm/mov/m4v | клиент + API (+ policy в yandex) |
 | фото ≤ 15 МБ, видео ≤ 200 МБ | клиент + API |
 | лимит файлов за заход (опционально) | клиент + API (`MAX_FILES_PER_REQUEST`, 0 = нет) |
-| rate limit по IP | API (`X-Forwarded-For`) |
+| rate limit по IP (галерея — вне лимита) | API, реальный IP берётся справа из `X-Forwarded-For` по `TRUSTED_PROXIES` |
+| EXIF/GPS удаляются из оригиналов (JPEG/HEIC) и display-версий | API (`STRIP_EXIF`) |
+| скрытые фото не отдаются по прямой ссылке (local) | `serve_file` → 404 |
+| админка защищена от перебора | отдельный rate limit (`ADMIN_PASSWORD`) |
 | случайные ключи | API |
 | path traversal | local resolve под `STORAGE_DIR` |
 | CORS бакета | только домен сайта (yandex) |

@@ -555,6 +555,25 @@ a {
   background: linear-gradient(180deg, rgba(11, 20, 16, 0.12), rgba(11, 20, 16, 0.5));
 }
 
+.tile-broken {
+  background: rgba(29, 59, 42, 0.5);
+}
+
+.lb-download {
+  position: absolute;
+  bottom: calc(3.2rem + var(--safe-b));
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--gold-light);
+  font-size: 0.85rem;
+  background: rgba(11, 20, 16, 0.72);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  text-decoration: none;
+  z-index: 1;
+}
+
 .filters {
   display: flex;
   gap: 0.4rem;

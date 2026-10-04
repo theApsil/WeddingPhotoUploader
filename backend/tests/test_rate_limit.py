@@ -30,4 +30,5 @@ def test_health(client):
     assert data["storage_backend"] == "local"
     assert data["storage_configured"] is True
     assert "image/jpeg" in data["allowed_types"]
-    assert data["storage_dir"]
+    # Internal storage path must not leak.
+    assert "storage_dir" not in data

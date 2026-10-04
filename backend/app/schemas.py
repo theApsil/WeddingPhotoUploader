@@ -16,6 +16,7 @@ class UploadedPhoto(BaseModel):
     url: str
     kind: str = "image"
     thumb_url: str | None = None
+    display_url: str | None = None
 
 
 class UploadResponse(BaseModel):
@@ -34,6 +35,7 @@ class PhotoOut(BaseModel):
     thumb_url: str | None = None
     thumb_width: int | None = None
     thumb_height: int | None = None
+    display_url: str | None = None
 
 
 class AdminPhotoOut(PhotoOut):
@@ -69,7 +71,6 @@ class HealthResponse(BaseModel):
     status: str
     storage_backend: str
     storage_configured: bool
-    storage_dir: str | None = None
     s3_bucket: str | None = None
     allowed_types: list[str] = Field(default_factory=lambda: sorted(ALLOWED_CONTENT_TYPES))
     max_file_size_mb: int
