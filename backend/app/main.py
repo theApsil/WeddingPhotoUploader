@@ -21,6 +21,7 @@ from app.config import (
     kind_of,
 )
 from app.db import PhotoRepository, resolve_db_path
+from app.filetype import SNIFF_BYTES, content_matches
 from app.rate_limit import RateLimiter
 from app.schemas import (
     AdminListResponse,
@@ -148,6 +149,14 @@ def enforce_rate_limit(request: Request, limiter: RateLimiter) -> None:
                 "Подождите минуту и попробуйте снова."
             ),
         )
+
+
+def _not_media_detail(name: str | None) -> str:
+    subject = f"«{name}»" if name else "Файл"
+    return (
+        f"{subject} не похож на фото или видео. "
+        "Нужны JPEG, PNG, WebP, HEIC, MP4, WebM или MOV."
+    )
 
 
 def validate_content_type(content_type: str) -> str:
@@ -327,6 +336,16 @@ def _register_routes(api: FastAPI) -> None:
                         f"Лимит для этого типа — {limit_mb} МБ."
                     ),
                 )
+            if not content_matches(content_type, data[:SNIFF_BYTES]):
+                logger.warning(
+                    "Отклонён %r: содержимое не совпадает с типом %s",
+                    upload.filename,
+                    content_type,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=_not_media_detail(upload.filename),
+                )
 
             key = build_object_key(content_type)
             local.save_bytes(key, data)
@@ -463,6 +482,19 @@ def _register_routes(api: FastAPI) -> None:
                     status_code=400,
                     detail=f"Объект «{file_in.key}» не найден в бакете.",
                 )
+            if not settings.s3_mock:
+                head = yandex.get_head(file_in.key, SNIFF_BYTES)
+                if head is None or not content_matches(content_type, head):
+                    logger.warning(
+                        "Отклонён %s: содержимое не совпадает с типом %s — удаляю из бакета",
+                        file_in.key,
+                        content_type,
+                    )
+                    yandex.delete(file_in.key)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_not_media_detail(None),
+                    )
             if kind_of(content_type) == "image":
                 raw = yandex.get_bytes(file_in.key)
                 if raw:

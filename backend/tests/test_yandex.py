@@ -100,6 +100,28 @@ def test_presign_rejects_oversize(client_yandex):
     assert res.status_code == 400
 
 
+def test_confirm_rejects_and_deletes_disguised_file(client_yandex, env_yandex):
+    """Bytes in the bucket are checked on confirm; a PDF posing as PNG is removed."""
+    payload = b"%PDF-1.4 not a photo"
+    presign = client_yandex.post(
+        "/api/uploads/presign",
+        json={"files": [{"content_type": "image/png", "size": len(payload)}]},
+    )
+    key = presign.json()["items"][0]["key"]
+    env_yandex["s3"].put_object(Bucket=env_yandex["bucket"], Key=key, Body=payload)
+
+    confirm = client_yandex.post(
+        "/api/uploads/confirm",
+        json={"files": [{"key": key, "content_type": "image/png", "size_bytes": len(payload)}]},
+    )
+    assert confirm.status_code == 400
+    assert "не похож на фото или видео" in confirm.json()["detail"]
+
+    listed = env_yandex["s3"].list_objects_v2(Bucket=env_yandex["bucket"])
+    assert listed.get("KeyCount", 0) == 0
+    assert client_yandex.get("/api/photos").json()["total"] == 0
+
+
 def test_storage_logs_s3_failures(env_yandex, caplog):
     from app.config import get_settings
     from app.storage import YandexStorage

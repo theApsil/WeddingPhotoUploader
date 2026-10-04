@@ -251,6 +251,22 @@ class YandexStorage:
             logger.exception("Не удалось скачать %s из бакета", key)
             return None
 
+    def get_head(self, key: str, size: int) -> bytes | None:
+        """Download the first `size` bytes of an object (None in mock mode or on failure)."""
+        if self.settings.s3_mock:
+            return None
+        client = self._get_client()
+        try:
+            resp = client.get_object(
+                Bucket=self.settings.s3_bucket,
+                Key=key,
+                Range=f"bytes=0-{size - 1}",
+            )
+            return resp["Body"].read()
+        except Exception:
+            logger.exception("Не удалось прочитать начало %s из бакета", key)
+            return None
+
     def put_bytes(self, key: str, data: bytes, content_type: str = "image/jpeg") -> bool:
         if self.settings.s3_mock:
             return True

@@ -96,6 +96,7 @@ function guessContentType(file) {
   const type = (file.type || "").toLowerCase();
   if (ALLOWED_TYPES.has(type)) return type;
   const name = (file.name || "").toLowerCase();
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
   if (name.endsWith(".png")) return "image/png";
   if (name.endsWith(".webp")) return "image/webp";
   if (name.endsWith(".heic")) return "image/heic";
@@ -104,7 +105,8 @@ function guessContentType(file) {
   if (name.endsWith(".webm")) return "video/webm";
   if (name.endsWith(".mov")) return "video/quicktime";
   if (name.endsWith(".m4v")) return "video/x-m4v";
-  return "image/jpeg";
+  // Unknown: never pretend it is a JPEG — validateFile rejects it.
+  return "";
 }
 
 function renderQueue() {
@@ -136,7 +138,7 @@ function renderQueue() {
       `<div class="status-row"></div>`;
     meta.querySelector(".name").textContent = item.file.name;
     meta.querySelector(".sub").textContent =
-      `${formatBytes(item.file.size)} · ${guessContentType(item.file)}`;
+      `${formatBytes(item.file.size)} · ${guessContentType(item.file) || "неизвестный тип"}`;
     meta.querySelector("i").style.width = `${item.progress || 0}%`;
 
     const row = meta.querySelector(".status-row");
@@ -145,13 +147,17 @@ function renderQueue() {
     if (item.error) {
       status.classList.add("err");
       status.textContent = item.error;
-      const retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "retry-btn";
-      retry.textContent = "Повторить";
-      retry.disabled = state.busy;
-      retry.addEventListener("click", () => retryOne(item.id));
-      row.append(status, retry);
+      row.append(status);
+      // Retrying the same file can't fix a wrong format or size.
+      if (!item.invalid) {
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.className = "retry-btn";
+        retry.textContent = "Повторить";
+        retry.disabled = state.busy;
+        retry.addEventListener("click", () => retryOne(item.id));
+        row.append(retry);
+      }
     } else if (item.done) {
       status.classList.add("ok");
       status.textContent = "готово";
@@ -209,6 +215,7 @@ function addFiles(fileList) {
       progress: 0,
       done: false,
       error: err,
+      invalid: Boolean(err),
     };
     if (!err && item.kind === "image" && type !== "image/heic" && type !== "image/heif") {
       try {
@@ -258,7 +265,9 @@ function uploadViaXhrLocal(file, onProgress) {
       const message = Array.isArray(detail)
         ? detail.map((x) => x.msg || JSON.stringify(x)).join("; ")
         : detail || `Сервер ответил ${xhr.status}`;
-      reject(new Error(message));
+      const err = new Error(message);
+      err.status = xhr.status;
+      reject(err);
     };
     xhr.onerror = () =>
       reject(new Error("Сеть оборвалась. Проверьте связь и нажмите «Повторить»."));
@@ -339,10 +348,24 @@ async function uploadOneYandex(item) {
 async function uploadOne(item) {
   item.error = null;
   item.progress = 0;
-  if (state.backend === "yandex") {
-    await uploadOneYandex(item);
-  } else {
-    await uploadOneLocal(item);
+  // Every attempt (first upload and «Повторить») goes through validation;
+  // limits may also have changed since the file was added (health loaded).
+  const invalid = validateFile(item.file);
+  if (invalid) {
+    item.invalid = true;
+    throw new Error(invalid);
+  }
+  try {
+    if (state.backend === "yandex") {
+      await uploadOneYandex(item);
+    } else {
+      await uploadOneLocal(item);
+    }
+  } catch (err) {
+    // 400 = the server rejected the file itself; resending it won't help.
+    // Network errors, 429 and 5xx stay retryable.
+    if (err.status === 400) item.invalid = true;
+    throw err;
   }
   item.progress = 100;
   item.done = true;

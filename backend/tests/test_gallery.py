@@ -114,7 +114,7 @@ def test_video_upload_kind_and_filter(client):
 
 def test_video_allowed_above_photo_limit(client):
     """Videos use their own (larger) size limit; 16 MB must be accepted."""
-    big = b"x" * (16 * 1024 * 1024)
+    big = TINY_VIDEO + b"x" * (16 * 1024 * 1024 - len(TINY_VIDEO))
     res = client.post(
         "/api/uploads",
         files=[("files", ("clip.mp4", big, "video/mp4"))],
