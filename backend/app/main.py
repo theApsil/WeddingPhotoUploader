@@ -21,6 +21,7 @@ from app.config import (
     kind_of,
 )
 from app.db import PhotoRepository, resolve_db_path
+from app.filetype import SNIFF_BYTES, content_matches
 from app.rate_limit import RateLimiter
 from app.schemas import (
     AdminListResponse,
@@ -46,6 +47,13 @@ _limiter: RateLimiter | None = None
 _storage: Storage | None = None
 
 logger = logging.getLogger("wedding")
+# uvicorn configures only its own loggers; without a handler our INFO lines are
+# dropped and errors print without context. Children (wedding.storage, …) inherit it.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 async def _backfill_thumbnails(
@@ -58,6 +66,7 @@ async def _backfill_thumbnails(
     try:
         rows = await repo.list_all(kind="image")
     except Exception:
+        logger.exception("Не удалось получить список фото для генерации превью")
         return
     created = 0
     for row in rows:
@@ -74,6 +83,7 @@ async def _backfill_thumbnails(
             if storage.save_thumb(key, path.read_bytes()):
                 created += 1
         except Exception:
+            logger.exception("Не удалось сгенерировать превью для %s", key)
             continue
     if created:
         logger.info("Сгенерировано превью для %s существующих фото", created)
@@ -141,6 +151,14 @@ def enforce_rate_limit(request: Request, limiter: RateLimiter) -> None:
         )
 
 
+def _not_media_detail(name: str | None) -> str:
+    subject = f"«{name}»" if name else "Файл"
+    return (
+        f"{subject} не похож на фото или видео. "
+        "Нужны JPEG, PNG, WebP, HEIC, MP4, WebM или MOV."
+    )
+
+
 def validate_content_type(content_type: str) -> str:
     normalized = (content_type or "").split(";")[0].strip().lower()
     if normalized not in ALLOWED_CONTENT_TYPES:
@@ -187,6 +205,7 @@ def _thumb_size(storage: Storage, key: str) -> tuple[int | None, int | None]:
         with Image.open(path) as im:
             return im.size
     except Exception:
+        logger.warning("Не удалось прочитать размер превью %s", path, exc_info=True)
         return None, None
 
 
@@ -316,6 +335,16 @@ def _register_routes(api: FastAPI) -> None:
                         f"Файл слишком большой ({size} байт). "
                         f"Лимит для этого типа — {limit_mb} МБ."
                     ),
+                )
+            if not content_matches(content_type, data[:SNIFF_BYTES]):
+                logger.warning(
+                    "Отклонён %r: содержимое не совпадает с типом %s",
+                    upload.filename,
+                    content_type,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail=_not_media_detail(upload.filename),
                 )
 
             key = build_object_key(content_type)
@@ -453,6 +482,19 @@ def _register_routes(api: FastAPI) -> None:
                     status_code=400,
                     detail=f"Объект «{file_in.key}» не найден в бакете.",
                 )
+            if not settings.s3_mock:
+                head = yandex.get_head(file_in.key, SNIFF_BYTES)
+                if head is None or not content_matches(content_type, head):
+                    logger.warning(
+                        "Отклонён %s: содержимое не совпадает с типом %s — удаляю из бакета",
+                        file_in.key,
+                        content_type,
+                    )
+                    yandex.delete(file_in.key)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=_not_media_detail(None),
+                    )
             if kind_of(content_type) == "image":
                 raw = yandex.get_bytes(file_in.key)
                 if raw:

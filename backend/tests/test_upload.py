@@ -51,6 +51,25 @@ def test_upload_rejects_bad_type(client):
     assert "не поддерживается" in res.json()["detail"]
 
 
+def test_upload_rejects_disguised_file(client):
+    """Declared type is not trusted: a PDF sent as image/jpeg is refused."""
+    res = client.post(
+        "/api/uploads",
+        files=[("files", ("x.jpg", b"%PDF-1.4 not a photo", "image/jpeg"))],
+    )
+    assert res.status_code == 400
+    assert "не похож на фото или видео" in res.json()["detail"]
+    assert client.get("/api/photos").json()["total"] == 0
+
+
+def test_upload_rejects_image_bytes_declared_as_video(client):
+    res = client.post(
+        "/api/uploads",
+        files=[("files", ("clip.mp4", TINY_PNG, "video/mp4"))],
+    )
+    assert res.status_code == 400
+
+
 def test_upload_rejects_oversize(client):
     big = b"x" * (15 * 1024 * 1024 + 1)
     res = client.post(
