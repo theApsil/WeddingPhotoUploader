@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from datetime import date
@@ -10,6 +11,11 @@ from typing import Any, Protocol
 
 from app.config import CONTENT_TYPE_EXTENSION, Settings, is_image, is_video
 from app.thumbnails import THUMB_PREFIX, generate_thumbnail, thumb_key_for
+
+logger = logging.getLogger("wedding.storage")
+
+# S3 error codes that just mean "no such object" — expected, not worth logging.
+_NOT_FOUND_CODES = {"404", "NoSuchKey", "NotFound"}
 
 
 def build_object_key(content_type: str, today: date | None = None) -> str:
@@ -93,6 +99,7 @@ class LocalStorage:
             return None
         thumb = generate_thumbnail(data, size=self.settings.thumbnail_size)
         if not thumb:
+            logger.warning("Превью не создано для %s", key)
             return None
         return self.save_bytes(self.thumb_key(key), thumb)
 
@@ -204,7 +211,10 @@ class YandexStorage:
         try:
             client.head_object(Bucket=self.settings.s3_bucket, Key=key)
             return True
-        except Exception:
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+            if code not in _NOT_FOUND_CODES:
+                logger.exception("Не удалось проверить объект %s в бакете", key)
             return False
 
     def photo_url(self, key: str, base_path: str = "") -> str:
@@ -238,6 +248,7 @@ class YandexStorage:
             resp = client.get_object(Bucket=self.settings.s3_bucket, Key=key)
             return resp["Body"].read()
         except Exception:
+            logger.exception("Не удалось скачать %s из бакета", key)
             return None
 
     def put_bytes(self, key: str, data: bytes, content_type: str = "image/jpeg") -> bool:
@@ -253,6 +264,7 @@ class YandexStorage:
             )
             return True
         except Exception:
+            logger.exception("Не удалось загрузить %s в бакет", key)
             return False
 
     def save_thumb(self, key: str, data: bytes) -> bool:
@@ -261,6 +273,7 @@ class YandexStorage:
             return False
         thumb = generate_thumbnail(data, size=self.settings.thumbnail_size)
         if not thumb:
+            logger.warning("Превью не создано для %s", key)
             return False
         return self.put_bytes(self.thumb_key(key), thumb)
 
@@ -272,6 +285,7 @@ class YandexStorage:
             client.delete_object(Bucket=self.settings.s3_bucket, Key=key)
             return True
         except Exception:
+            logger.exception("Не удалось удалить %s из бакета", key)
             return False
 
     def _content_type(self, key: str) -> str:

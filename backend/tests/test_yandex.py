@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import requests
 
 TINY_PNG = (
@@ -96,3 +98,36 @@ def test_presign_rejects_oversize(client_yandex):
         json={"files": [{"content_type": "image/jpeg", "size": 15 * 1024 * 1024 + 1}]},
     )
     assert res.status_code == 400
+
+
+def test_storage_logs_s3_failures(env_yandex, caplog):
+    from app.config import get_settings
+    from app.storage import YandexStorage
+
+    storage = YandexStorage(get_settings())
+    with caplog.at_level(logging.WARNING, logger="wedding"):
+        # Missing object is an expected answer, not an error.
+        assert storage.object_exists("uploads/2026-01-01/missing.png") is False
+        assert not caplog.records
+
+        broken = YandexStorage(get_settings().model_copy(update={"s3_bucket": "no-such-bucket"}))
+        assert broken.put_bytes("thumbs/2026-01-01/x.jpg", b"x") is False
+        assert broken.get_bytes("uploads/2026-01-01/x.png") is None
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert "Не удалось загрузить thumbs/2026-01-01/x.jpg в бакет" in messages
+    assert "Не удалось скачать uploads/2026-01-01/x.png из бакета" in messages
+    assert all(r.exc_info for r in caplog.records)
+
+
+def test_thumbnail_failure_is_logged(env_yandex, caplog):
+    from app.config import get_settings
+    from app.storage import YandexStorage
+
+    storage = YandexStorage(get_settings())
+    with caplog.at_level(logging.WARNING, logger="wedding"):
+        assert storage.save_thumb("uploads/2026-01-01/bad.png", b"not an image") is False
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("Не удалось декодировать изображение") for m in messages)
+    assert "Превью не создано для uploads/2026-01-01/bad.png" in messages

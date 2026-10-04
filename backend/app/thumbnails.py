@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from io import BytesIO
 
 THUMB_PREFIX = "thumbs"
 THUMB_EXTENSION = "jpg"
+
+logger = logging.getLogger("wedding.thumbnails")
 
 # Enable HEIC/HEIF decoding for thumbnails when pillow-heif is installed.
 try:
@@ -13,7 +16,10 @@ try:
 
     pillow_heif.register_heif_opener()
 except Exception:  # pragma: no cover - optional dependency
-    pass
+    logger.warning(
+        "pillow-heif недоступен — превью HEIC/HEIF создаваться не будут",
+        exc_info=True,
+    )
 
 
 def thumb_key_for(key: str) -> str:
@@ -35,7 +41,10 @@ def generate_thumbnail(data: bytes, size: int = 400) -> bytes | None:
         return None
     try:
         from PIL import Image, ImageOps
-
+    except ImportError:
+        logger.error("Pillow не установлен — превью не создаются (pip install -r requirements.txt)")
+        return None
+    try:
         with Image.open(BytesIO(data)) as img:
             img = ImageOps.exif_transpose(img)
             img.thumbnail((size, size))
@@ -45,6 +54,7 @@ def generate_thumbnail(data: bytes, size: int = 400) -> bytes | None:
             img.save(out, "JPEG", quality=82, optimize=True)
             return out.getvalue()
     except Exception:
+        logger.warning("Не удалось декодировать изображение (%s байт)", len(data), exc_info=True)
         return None
 
 

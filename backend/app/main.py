@@ -46,6 +46,13 @@ _limiter: RateLimiter | None = None
 _storage: Storage | None = None
 
 logger = logging.getLogger("wedding")
+# uvicorn configures only its own loggers; without a handler our INFO lines are
+# dropped and errors print without context. Children (wedding.storage, …) inherit it.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:     %(name)s - %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
 
 async def _backfill_thumbnails(
@@ -58,6 +65,7 @@ async def _backfill_thumbnails(
     try:
         rows = await repo.list_all(kind="image")
     except Exception:
+        logger.exception("Не удалось получить список фото для генерации превью")
         return
     created = 0
     for row in rows:
@@ -74,6 +82,7 @@ async def _backfill_thumbnails(
             if storage.save_thumb(key, path.read_bytes()):
                 created += 1
         except Exception:
+            logger.exception("Не удалось сгенерировать превью для %s", key)
             continue
     if created:
         logger.info("Сгенерировано превью для %s существующих фото", created)
@@ -187,6 +196,7 @@ def _thumb_size(storage: Storage, key: str) -> tuple[int | None, int | None]:
         with Image.open(path) as im:
             return im.size
     except Exception:
+        logger.warning("Не удалось прочитать размер превью %s", path, exc_info=True)
         return None, None
 
 
