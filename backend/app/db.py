@@ -207,10 +207,16 @@ class PhotoRepository:
         pending: bool | None = None,
         kind: str = "all",
         guest: str | None = None,
+        before: tuple[str, int] | None = None,
     ) -> list[dict[str, Any]]:
+        """Newest first. ``before`` = (uploaded_at, id) of the last row already
+        shown (keyset pagination: unaffected by rows added or removed meanwhile)."""
         where, params = self._filters(
             hidden=hidden, pending=pending, kind=kind, guest=guest
         )
+        if before is not None:
+            where.append("(uploaded_at, id) < (?, ?)")
+            params += [before[0], before[1]]
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
                    client_ip, guest_name, hidden, pending, thumb_width,
@@ -253,9 +259,10 @@ class PhotoRepository:
     ) -> list[dict[str, Any]]:
         """All rows (no pagination) — used for backfill / maintenance."""
         where, params = self._filters(kind=kind, hidden=hidden, pending=pending)
-        sql = "SELECT id, object_key, content_type FROM photos"
+        sql = "SELECT id, object_key, content_type, size_bytes, uploaded_at FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY uploaded_at, id"
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(sql, params)

@@ -35,17 +35,18 @@ export const SITE = {
   tagline: "Поделитесь своими снимками с нашего дня",
 };
 
-/** Public prefix when the UI is served under a subpath (e.g. /wedding). */
+/** Public prefix when the UI is served under a subpath (e.g. /wedding).
+ *
+ * Derived from where this script itself is served (<prefix>/js/common.js), so
+ * any BASE_PATH works without editing HTML. An explicit
+ * <meta name="base-path" content="..."> still wins, e.g. for scripts on a CDN.
+ */
 export function detectBasePath() {
   const meta = document.querySelector('meta[name="base-path"]');
   if (meta) {
     return (meta.getAttribute("content") || "").replace(/\/$/, "");
   }
-  const path = window.location.pathname || "";
-  if (path === "/wedding" || path.startsWith("/wedding/")) {
-    return "/wedding";
-  }
-  return "";
+  return new URL("..", import.meta.url).pathname.replace(/\/$/, "");
 }
 
 export const BASE_PATH = detectBasePath();
@@ -145,4 +146,10 @@ export function clearGuestName() {
 
 export function guestName() {
   return getCookie(GUEST_NAME_COOKIE).trim();
+}
+
+/** A guest whose name is remembered never needs the home (name) page in the nav. */
+export function hideHomeForKnownGuest() {
+  if (!guestName()) return;
+  document.querySelectorAll(`.nav-link[href="${HOME_URL}"]`).forEach((link) => link.remove());
 }

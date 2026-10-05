@@ -57,6 +57,8 @@ class PhotoListResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
+    # Pass back as ?cursor= for the next page; stable when new photos arrive.
+    next_cursor: str | None = None
 
 
 class AdminListResponse(BaseModel):
@@ -65,6 +67,12 @@ class AdminListResponse(BaseModel):
     limit: int
     offset: int
     has_more: bool
+    next_cursor: str | None = None
+
+
+class ArchiveTokenResponse(BaseModel):
+    token: str
+    expires_in: int
 
 
 class PhotoPatchRequest(BaseModel):

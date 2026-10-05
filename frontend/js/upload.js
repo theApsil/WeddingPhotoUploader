@@ -7,6 +7,7 @@ import {
   HOME_URL,
   api,
   applySiteCopy,
+  hideHomeForKnownGuest,
   clearGuestName,
   formatBytes,
   guestName,
@@ -601,6 +602,7 @@ function bind() {
 
 async function boot() {
   applySiteCopy();
+  hideHomeForKnownGuest();
   // Guest must have entered their name on the home page; otherwise send them back.
   const name = guestName();
   if (!name) {
