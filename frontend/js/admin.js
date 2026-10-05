@@ -84,6 +84,27 @@ function renderMore() {
   }
 }
 
+/** Does an item still belong to the list under the current filters? */
+function matchesFilters(item) {
+  if (Boolean(item.hidden) !== els.showHidden.checked) return false;
+  if (els.pendingOnly.checked && !item.pending) return false;
+  return true;
+}
+
+/** Apply a PATCH result; drop the row if it left the current filter. */
+function applyUpdate(item, updated) {
+  item.hidden = updated.hidden;
+  item.pending = updated.pending;
+  if (!matchesFilters(item)) {
+    state.items = state.items.filter((it) => it.id !== item.id);
+    state.total = Math.max(0, state.total - 1);
+    // Server-side the row left this filter, so the next page starts one earlier.
+    state.offset = state.items.length;
+  }
+  renderList(false);
+  showAlert(els.adminAlert, "", "error");
+}
+
 function rowActions(item, li) {
   const actions = document.createElement("div");
   actions.className = "admin-actions";
@@ -100,8 +121,7 @@ function rowActions(item, li) {
           method: "PATCH",
           body: JSON.stringify({ pending: false }),
         });
-        item.pending = updated.pending;
-        renderList(false);
+        applyUpdate(item, updated);
       } catch (err) {
         showAlert(els.adminAlert, `Не удалось одобрить: ${err.message}`, "error");
       }
@@ -117,9 +137,7 @@ function rowActions(item, li) {
           method: "PATCH",
           body: JSON.stringify({ pending: true, hidden: true }),
         });
-        item.pending = updated.pending;
-        item.hidden = updated.hidden;
-        renderList(false);
+        applyUpdate(item, updated);
       } catch (err) {
         showAlert(els.adminAlert, `Не удалось отклонить: ${err.message}`, "error");
       }
@@ -137,9 +155,7 @@ function rowActions(item, li) {
         method: "PATCH",
         body: JSON.stringify({ hidden: !item.hidden }),
       });
-      item.hidden = updated.hidden;
-      renderList(false);
-      showAlert(els.adminAlert, "", "error");
+      applyUpdate(item, updated);
     } catch (err) {
       showAlert(els.adminAlert, `Не удалось обновить: ${err.message}`, "error");
     }
@@ -215,8 +231,17 @@ function renderList(keepList = true) {
   renderMore();
 }
 
+// In-flight list request; a new filter aborts it so the latest click wins.
+let inflight = null;
+
 async function load(reset = false) {
-  if (state.loading) return;
+  if (reset) {
+    inflight?.abort();
+  } else if (state.loading) {
+    return; // "Показать ещё" while a page is already coming
+  }
+  const controller = new AbortController();
+  inflight = controller;
   if (reset) {
     state.offset = 0;
     state.items = [];
@@ -231,7 +256,9 @@ async function load(reset = false) {
     const data = await adminFetch(
       `/api/admin/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}` +
         `&hidden=${hidden}${pending ? `&pending=${pending}` : ""}${guest}`,
+      { signal: controller.signal },
     );
+    if (controller !== inflight) return; // superseded by a newer filter
     state.total = data.total;
     state.items = reset ? data.items : state.items.concat(data.items);
     state.offset = state.items.length;
@@ -241,11 +268,16 @@ async function load(reset = false) {
       setStatus("Ничего не найдено.", false);
     }
   } catch (err) {
+    if (controller !== inflight || err.name === "AbortError") return;
     setStatus("", true);
     showAlert(els.adminAlert, `Не получилось загрузить список: ${err.message}`, "error");
     if (err.status === 401) logout();
   } finally {
-    state.loading = false;
+    if (controller === inflight) {
+      state.loading = false;
+      inflight = null;
+      renderMore();
+    }
   }
 }
 
@@ -299,7 +331,6 @@ function bind() {
   els.pendingOnly.addEventListener("change", () => load(true));
   if (els.guestFilter) {
     els.guestFilter.addEventListener("change", () => {
-      if (state.loading) return;
       state.guest = els.guestFilter.value;
       load(true);
     });
@@ -309,8 +340,7 @@ function bind() {
   }
   document.querySelectorAll("#panel .filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      // Ignore clicks while a request is in flight so the filter isn't lost.
-      if (state.loading) return;
+      // A newer filter aborts the in-flight request inside load(true).
       document.querySelectorAll("#panel .filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;

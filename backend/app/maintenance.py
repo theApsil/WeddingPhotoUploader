@@ -6,6 +6,7 @@ skipped rather than taking the service down.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import time
@@ -79,10 +80,12 @@ async def cleanup_orphans(repo: PhotoRepository, storage, age_hours: int) -> int
     known = {r["object_key"] for r in rows}
     cutoff = _cutoff(age_hours)
 
+    # Listing/deleting is blocking I/O (filesystem walk or boto3) — keep it off
+    # the event loop so guests aren't stalled during the pass.
     if isinstance(storage, LocalStorage):
-        return _cleanup_local_orphans(storage, known, cutoff)
+        return await asyncio.to_thread(_cleanup_local_orphans, storage, known, cutoff)
     if isinstance(storage, YandexStorage):
-        return _cleanup_yandex_orphans(storage, known, cutoff)
+        return await asyncio.to_thread(_cleanup_yandex_orphans, storage, known, cutoff)
     return 0
 
 
@@ -147,9 +150,15 @@ def ensure_bucket_versioning(storage) -> bool:
         return False
     if storage.settings.s3_mock:
         return False
+    client = storage._get_client()
+    bucket = storage.settings.s3_bucket
     try:
-        storage._get_client().put_bucket_versioning(
-            Bucket=storage.settings.s3_bucket,
+        # Usually enabled once in the console; reading it needs fewer rights
+        # than PutBucketVersioning, so don't log AccessDenied on every pass.
+        if client.get_bucket_versioning(Bucket=bucket).get("Status") == "Enabled":
+            return True
+        client.put_bucket_versioning(
+            Bucket=bucket,
             VersioningConfiguration={"Status": "Enabled"},
         )
         logger.info("Версионирование бакета включено")
@@ -162,10 +171,10 @@ def ensure_bucket_versioning(storage) -> bool:
 async def run_once(repo: PhotoRepository, storage, settings: Settings) -> None:
     """Run a full maintenance pass."""
     if isinstance(storage, YandexStorage) and not storage.settings.s3_mock:
-        ensure_bucket_versioning(storage)
+        await asyncio.to_thread(ensure_bucket_versioning, storage)
     await cleanup_orphans(repo, storage, settings.orphan_max_age_hours)
     if settings.backup_hours > 0:
-        backup_sqlite(settings)
+        await asyncio.to_thread(backup_sqlite, settings)
 
 
 async def maintenance_loop(
@@ -175,16 +184,9 @@ async def maintenance_loop(
     interval = settings.backup_hours * 3600
     if interval <= 0:
         interval = 3600  # still allow orphan cleanup / versioning on a sane cadence
-    await run_once(repo, storage, settings)
     while True:
-        await asyncio_sleep(interval)
         try:
             await run_once(repo, storage, settings)
         except Exception:
             logger.exception("Сбой фонового обслуживания")
-
-
-async def asyncio_sleep(seconds: float) -> None:
-    import asyncio
-
-    await asyncio.sleep(seconds)
+        await asyncio.sleep(interval)

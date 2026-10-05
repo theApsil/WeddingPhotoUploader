@@ -95,15 +95,15 @@ class Settings(BaseSettings):
     #   BACKUP_HOURS         — interval between SQLite backups;
     #   BACKUP_KEEP          — how many old backups to keep;
     #   ORPHAN_MAX_AGE_HOURS — delete objects with no DB row older than this.
-    backup_hours: int = Field(default=0, alias="BACKUP_HOURS")
-    backup_keep: int = Field(default=7, alias="BACKUP_KEEP")
+    backup_hours: int = Field(default=6, alias="BACKUP_HOURS")
+    backup_keep: int = Field(default=28, alias="BACKUP_KEEP")
     orphan_max_age_hours: int = Field(default=24, alias="ORPHAN_MAX_AGE_HOURS")
 
     site_domain: str = Field(default="", alias="SITE_DOMAIN")
     cors_origins: str = Field(default="", alias="CORS_ORIGINS")
 
-    max_file_size_mb: int = Field(default=15, alias="MAX_FILE_SIZE_MB")
-    max_video_size_mb: int = Field(default=200, alias="MAX_VIDEO_SIZE_MB")
+    max_file_size_mb: int = Field(default=40, alias="MAX_FILE_SIZE_MB")
+    max_video_size_mb: int = Field(default=500, alias="MAX_VIDEO_SIZE_MB")
     # 0 = no per-request file count limit.
     max_files_per_request: int = Field(default=0, alias="MAX_FILES_PER_REQUEST")
     rate_limit_per_minute: int = Field(default=20, alias="RATE_LIMIT_PER_MINUTE")
@@ -123,7 +123,10 @@ class Settings(BaseSettings):
     trusted_proxies: int = Field(default=1, alias="TRUSTED_PROXIES")
 
     # Strip EXIF/GPS from stored originals (local) and display JPEGs.
-    strip_exif: bool = Field(default=True, alias="STRIP_EXIF")
+    # Off by default: strip_exif_jpeg drops the Orientation tag and ICC profile,
+    # so portrait phone photos end up sideways and the bucket original is
+    # overwritten. Do not enable until that is fixed.
+    strip_exif: bool = Field(default=False, alias="STRIP_EXIF")
 
     # Admin panel password. Empty = admin endpoints disabled.
     admin_password: str = Field(default="", alias="ADMIN_PASSWORD")

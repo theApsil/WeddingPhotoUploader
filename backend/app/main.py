@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Union
+from urllib.parse import unquote
 from zipfile import ZIP_STORED, ZipFile
 
 from fastapi import (
@@ -222,7 +223,8 @@ _GUEST_NAME_MAX = 80
 
 def _guest_name(request: Request) -> str:
     """Read the remembered guest name from the cookie, sanitized and length-capped."""
-    raw = (request.cookies.get("guest_name") or "").strip()
+    # The frontend stores the name with encodeURIComponent (Cyrillic -> %D0%9F...).
+    raw = unquote((request.cookies.get("guest_name") or "").strip())
     cleaned = "".join(ch for ch in raw if ch.isprintable() and ch not in "\r\n\t")
     return cleaned[:_GUEST_NAME_MAX]
 
@@ -266,7 +268,8 @@ def require_admin(
 ) -> None:
     """Reject admin calls unless the correct password is presented as a bearer token.
 
-    Also rate-limits per (real) IP so the password can't be brute-forced quickly.
+    Only failed attempts count against the per-IP admin limiter, so normal
+    moderation (many requests a minute) is never throttled.
     """
     password = settings.admin_password
     if not password:
@@ -274,23 +277,20 @@ def require_admin(
             status_code=503,
             detail="Админка отключена. Задайте ADMIN_PASSWORD в .env.",
         )
-    header = request.headers.get("Authorization", "")
-    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
-    if not token or not hmac.compare_digest(token, password):
-        # Count failed attempts against the tight admin limiter too.
-        enforce_admin_rate_limit(request, settings)
-        raise HTTPException(status_code=401, detail="Неверный пароль администратора.")
-    enforce_admin_rate_limit(request, settings)
-
-
-def enforce_admin_rate_limit(request: Request, settings: Settings) -> None:
     limiter = get_admin_limiter()
-    allowed, _remaining = limiter.allow(client_ip(request, settings.trusted_proxies))
-    if not allowed:
+    ip = client_ip(request, settings.trusted_proxies)
+    # Checked before the password: once an IP is blocked even a correct guess
+    # gets 429, so the response can't confirm it.
+    if limiter.blocked(ip):
         raise HTTPException(
             status_code=429,
             detail="Слишком много попыток входа. Подождите минуту.",
         )
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token or not hmac.compare_digest(token, password):
+        limiter.allow(ip)
+        raise HTTPException(status_code=401, detail="Неверный пароль администратора.")
 
 
 def _thumb_url_for(row: dict[str, Any], storage: Storage, base: str) -> str | None:

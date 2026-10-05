@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
 try:  # Pillow is required for derived images; fail gracefully when missing.
     from PIL import Image, ImageOps
+
+    # Pillow refuses images above 2x this as "decompression bombs"; the default
+    # (~179 MP hard limit) rejects 200 MP phone shots (16320x12240 = 200 MP).
+    Image.MAX_IMAGE_PIXELS = 250_000_000
 except Exception:  # pragma: no cover - optional dependency
     Image = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]

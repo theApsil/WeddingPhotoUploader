@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import aiosqlite
+
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -55,6 +59,25 @@ class PhotoRepository:
         for name, decl in additions.items():
             if name not in existing:
                 await db.execute(f"ALTER TABLE photos ADD COLUMN {name} {decl}")
+        await self._decode_guest_names(db)
+
+    async def _decode_guest_names(self, db: aiosqlite.Connection) -> None:
+        """Fix names stored percent-encoded (%D0%9F...) before the cookie was decoded."""
+        cursor = await db.execute(
+            "SELECT DISTINCT guest_name FROM photos WHERE guest_name LIKE '%!%%' ESCAPE '!'"
+        )
+        for (name,) in await cursor.fetchall():
+            if not _PERCENT_ESCAPE.search(name):
+                continue
+            try:
+                decoded = unquote(name, errors="strict")
+            except UnicodeDecodeError:
+                continue  # not our encoding — leave the name as is
+            if decoded != name:
+                await db.execute(
+                    "UPDATE photos SET guest_name = ? WHERE guest_name = ?",
+                    (decoded, name),
+                )
 
     async def add(
         self,

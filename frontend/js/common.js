@@ -17,8 +17,8 @@ export const VIDEO_TYPES = new Set([
 
 export const ALLOWED_TYPES = new Set([...IMAGE_TYPES, ...VIDEO_TYPES]);
 
-export const MAX_SIZE_MB_DEFAULT = 15;
-export const MAX_VIDEO_SIZE_MB_DEFAULT = 200;
+export const MAX_SIZE_MB_DEFAULT = 40;
+export const MAX_VIDEO_SIZE_MB_DEFAULT = 500;
 // 0 = no per-request file count limit.
 export const MAX_FILES_DEFAULT = 0;
 
