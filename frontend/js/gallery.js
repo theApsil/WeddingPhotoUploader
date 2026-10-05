@@ -1,4 +1,11 @@
-import { api, applySiteCopy, formatBytes, formatWhen, showAlert } from "./common.js";
+import {
+  api,
+  applySiteCopy,
+  formatBytes,
+  formatWhen,
+  hideHomeForKnownGuest,
+  showAlert,
+} from "./common.js";
 
 const els = {
   grid: document.getElementById("gallery"),
@@ -311,6 +318,7 @@ function bindLightbox() {
 }
 
 applySiteCopy();
+hideHomeForKnownGuest();
 bindFilters();
 bindLightbox();
 loadGuests();

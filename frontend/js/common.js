@@ -146,3 +146,9 @@ export function clearGuestName() {
 export function guestName() {
   return getCookie(GUEST_NAME_COOKIE).trim();
 }
+
+/** A guest whose name is remembered never needs the home (name) page in the nav. */
+export function hideHomeForKnownGuest() {
+  if (!guestName()) return;
+  document.querySelectorAll(`.nav-link[href="${HOME_URL}"]`).forEach((link) => link.remove());
+}

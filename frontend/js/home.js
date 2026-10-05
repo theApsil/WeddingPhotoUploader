@@ -14,7 +14,8 @@ const els = {
 };
 
 function go() {
-  window.location.assign(UPLOAD_URL);
+  // replace(): the home page must not stay in history once a name is known.
+  window.location.replace(UPLOAD_URL);
 }
 
 async function boot() {

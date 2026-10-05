@@ -1,6 +1,7 @@
 import {
   BASE_PATH,
   applySiteCopy,
+  hideHomeForKnownGuest,
   formatBytes,
   formatWhen,
   showAlert,
@@ -390,5 +391,6 @@ async function downloadArchive() {
 }
 
 applySiteCopy();
+hideHomeForKnownGuest();
 bind();
 showPanel();
