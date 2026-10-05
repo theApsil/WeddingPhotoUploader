@@ -29,6 +29,14 @@ CREATE TABLE IF NOT EXISTS photos (
     display_height INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC, id DESC);
+
+-- Keys the app handed out (presign) or started writing (local upload) that are
+-- not in photos yet. Orphan cleanup deletes only these — never "anything in
+-- storage without a row" — so a lost or restored DB can't wipe real photos.
+CREATE TABLE IF NOT EXISTS unconfirmed_uploads (
+    object_key TEXT PRIMARY KEY,
+    issued_at TEXT NOT NULL
+);
 """
 
 
@@ -299,6 +307,44 @@ class PhotoRepository:
             await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
             await db.commit()
         return row
+
+
+    async def track_unconfirmed(self, keys: list[str], issued_at: str) -> None:
+        """Remember keys handed out for upload until they are confirmed."""
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO unconfirmed_uploads (object_key, issued_at) VALUES (?, ?)",
+                [(key, issued_at) for key in keys],
+            )
+            await db.commit()
+
+    async def untrack_unconfirmed(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "DELETE FROM unconfirmed_uploads WHERE object_key = ?",
+                [(key,) for key in keys],
+            )
+            await db.commit()
+
+    async def stale_unconfirmed(self, issued_before: str, limit: int) -> list[str]:
+        """Tracked keys issued before the cutoff that never became a photo (oldest first)."""
+        async with aiosqlite.connect(self.database_path) as db:
+            # Confirmed but not untracked (e.g. crash in between) — just forget them.
+            await db.execute(
+                "DELETE FROM unconfirmed_uploads"
+                " WHERE object_key IN (SELECT object_key FROM photos)"
+            )
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT object_key FROM unconfirmed_uploads"
+                " WHERE issued_at < ? ORDER BY issued_at LIMIT ?",
+                (issued_before, limit),
+            )
+            return [row[0] for row in await cursor.fetchall()]
 
 
 def resolve_db_path(path: str) -> str:

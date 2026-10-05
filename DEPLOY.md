@@ -163,7 +163,8 @@ curl -sS https://photos.example.com/wedding/api/health
 
 Новые настройки (необязательно): `PRE_MODERATION=true` для премодерации загрузок,
 `BACKUP_HOURS` для авто-бэкапа SQLite, `VIDEO_POSTER=true` (по умолчанию) для
-постеров видео через ffmpeg.
+постеров видео через ffmpeg (`sudo apt install ffmpeg`; без него постеры просто
+не создаются, видео при этом не скачивается).
 
 ## 8. Бэкап
 
@@ -185,17 +186,12 @@ aws --endpoint-url=https://storage.yandexcloud.net \
 # плюс файл data/photos.db (метаданные галереи)
 ```
 
-Версионирование бакета приложение включает автоматически. Очистку не-подтверждённых
-объектов (браузер запросил presign, но не загрузил) приложение делает само
-(`ORPHAN_MAX_AGE_HOURS`). Если приложение не всегда запущено, продублируйте это
-lifecycle-правилом на бакете:
+Версионирование бакета приложение включает автоматически. Незавершённые загрузки
+(браузер запросил presign, но не загрузил) приложение удаляет само
+(`ORPHAN_MAX_AGE_HOURS`), только по своему списку выданных ключей.
 
-```bash
-aws --endpoint-url=https://storage.yandexcloud.net \
-  s3api put-bucket-lifecycle-configuration \
-  --bucket "$S3_BUCKET" \
-  --lifecycle-configuration file://scripts/bucket-lifecycle.json
-```
+**Не ставьте lifecycle-правило с истечением на префикс `uploads/`**: S3 не знает,
+какие объекты подтверждены, и через N дней удалит **все** оригиналы гостей.
 
 ## 9. Docker Compose (альтернатива)
 

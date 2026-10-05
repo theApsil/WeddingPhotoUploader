@@ -35,7 +35,7 @@ from app.config import (
 from app.db import PhotoRepository, resolve_db_path
 from app.filetype import SNIFF_BYTES, content_matches
 from app.maintenance import maintenance_loop
-from app.poster import generate_poster_from_bytes, generate_poster_from_path
+from app.poster import generate_poster_from_path, generate_poster_from_url
 from app.rate_limit import RateLimiter
 from app.thumbnails import image_dimensions, sanitize_original
 from app.schemas import (
@@ -446,12 +446,13 @@ def _make_local_poster(
 def _make_yandex_poster(
     yandex: YandexStorage, key: str, ffmpeg: str
 ) -> bool:
-    """Download a bucket video once and extract a poster frame (best-effort)."""
+    """Extract a poster frame from a bucket video (best-effort).
+
+    ffmpeg reads the object over a signed URL with HTTP range requests, so only
+    the bytes it needs are fetched — the video is never downloaded whole.
+    """
     try:
-        data = yandex.get_bytes(key)
-        if not data:
-            return False
-        poster = generate_poster_from_bytes(data, ffmpeg)
+        poster = generate_poster_from_url(yandex.photo_url(key), ffmpeg)
         if not poster:
             return False
         return yandex.save_poster(key, poster)
@@ -582,6 +583,8 @@ def _register_routes(api: FastAPI) -> None:
                 )
 
             key = build_object_key(content_type)
+            # Ledger entry covers a crash between writing the file and the DB row.
+            await repo.track_unconfirmed([key], now)
             dims: tuple[int, int] | None = None
             if kind_of(content_type) == "image":
                 data, dims = await asyncio.to_thread(
@@ -609,6 +612,7 @@ def _register_routes(api: FastAPI) -> None:
                 display_width=dims[0] if dims else None,
                 display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([key])
             if row:
                 saved.append(
                     UploadedPhoto(
@@ -644,6 +648,7 @@ def _register_routes(api: FastAPI) -> None:
         settings: Annotated[Settings, Depends(get_settings)],
         limiter: Annotated[RateLimiter, Depends(get_limiter)],
         storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> PresignResponse:
         """Issue browser POST policies for Yandex Object Storage."""
         yandex = _require_yandex(storage)
@@ -699,6 +704,10 @@ def _register_routes(api: FastAPI) -> None:
                     fields=signed["fields"],
                 )
             )
+        # Only these keys may ever be removed by orphan cleanup (if never confirmed).
+        await repo.track_unconfirmed(
+            [item.key for item in items], datetime.now(timezone.utc).isoformat()
+        )
         return PresignResponse(items=items)
 
     @api.post("/api/uploads/confirm", response_model=ConfirmResponse)
@@ -756,6 +765,8 @@ def _register_routes(api: FastAPI) -> None:
                         detail=f"Объект «{file_in.key}» не найден в бакете.",
                     )
                 if reason == "mismatch":
+                    # The object was deleted right away; nothing left to clean up.
+                    await repo.untrack_unconfirmed([file_in.key])
                     raise HTTPException(status_code=400, detail=_not_media_detail(None))
                 raise HTTPException(status_code=400, detail="Не удалось прочитать объект.")
 
@@ -782,6 +793,7 @@ def _register_routes(api: FastAPI) -> None:
                 display_width=dims[0] if dims else None,
                 display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([file_in.key])
             if row:
                 saved.append(
                     UploadedPhoto(
