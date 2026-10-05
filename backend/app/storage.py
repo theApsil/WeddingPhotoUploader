@@ -254,6 +254,10 @@ class YandexStorage:
         )
         return {"url": result["url"], "fields": result["fields"]}
 
+    def exists(self, key: str) -> bool:
+        """Same contract as LocalStorage.exists (used by the startup backfill)."""
+        return self.object_exists(key)
+
     def object_exists(self, key: str) -> bool:
         if self.settings.s3_mock:
             # In mock mode confirm trusts the client after a successful "upload" stub.

@@ -259,7 +259,10 @@ class PhotoRepository:
     ) -> list[dict[str, Any]]:
         """All rows (no pagination) — used for backfill / maintenance."""
         where, params = self._filters(kind=kind, hidden=hidden, pending=pending)
-        sql = "SELECT id, object_key, content_type, size_bytes, uploaded_at FROM photos"
+        sql = (
+            "SELECT id, object_key, content_type, size_bytes, uploaded_at, thumb_width"
+            " FROM photos"
+        )
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += " ORDER BY uploaded_at, id"

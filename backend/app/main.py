@@ -67,6 +67,7 @@ _limiter: RateLimiter | None = None
 _admin_limiter: RateLimiter | None = None
 _storage: Storage | None = None
 _maintenance_task: asyncio.Task | None = None
+_backfill_task: asyncio.Task | None = None
 
 logger = logging.getLogger("wedding")
 # uvicorn configures only its own loggers; without a handler our INFO lines are
@@ -81,8 +82,9 @@ if not logger.handlers:
 async def _backfill_derived(repo: PhotoRepository, storage: Storage) -> None:
     """Generate missing thumbnails + display JPEGs (and store dimensions).
 
-    Runs once at startup so pre-existing photos get derived images too.
-    Yandex downloads each missing image once (skipped in mock mode).
+    Runs once at startup (in the background) so pre-existing photos get
+    derived images too. Yandex downloads each missing image once (skipped in
+    mock mode).
     """
     try:
         rows = await repo.list_all(kind="image")
@@ -92,6 +94,10 @@ async def _backfill_derived(repo: PhotoRepository, storage: Storage) -> None:
 
     def _process_one(row: dict[str, Any]) -> tuple[bool, tuple[int, int] | None]:
         key = row["object_key"]
+        # Dimensions are stored together with the derived images, so such rows
+        # are done — skip them without two HEAD requests per photo on Yandex.
+        if row.get("thumb_width"):
+            return False, None
         try:
             if storage.exists(storage.thumb_key(key)) and storage.exists(
                 storage.display_key(key)
@@ -154,7 +160,7 @@ def _frontend_dir(settings: Settings) -> Path | None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    global _repo, _limiter, _admin_limiter, _storage, _maintenance_task
+    global _repo, _limiter, _admin_limiter, _storage, _maintenance_task, _backfill_task
     settings = get_settings()
     _repo = PhotoRepository(resolve_db_path(settings.database_path))
     await _repo.init()
@@ -163,18 +169,22 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     _admin_limiter = RateLimiter(limit_per_minute=10)
     _storage = create_storage(settings)
     _storage.ensure_ready()
-    await _backfill_derived(_repo, _storage)
+    # In the background: with many photos the pass takes a while, and the app
+    # must answer (health check, guests) right away.
+    _backfill_task = asyncio.create_task(_backfill_derived(_repo, _storage))
     _maintenance_task = asyncio.create_task(maintenance_loop(_repo, _storage, settings))
     try:
         yield
     finally:
-        if _maintenance_task is not None:
-            _maintenance_task.cancel()
-            try:
-                await _maintenance_task
-            except asyncio.CancelledError:
-                pass
-            _maintenance_task = None
+        for task in (_backfill_task, _maintenance_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        _backfill_task = None
+        _maintenance_task = None
 
 
 def get_repo() -> PhotoRepository:
