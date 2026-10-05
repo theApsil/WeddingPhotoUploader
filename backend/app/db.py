@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import aiosqlite
+
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -25,6 +29,14 @@ CREATE TABLE IF NOT EXISTS photos (
     display_height INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC, id DESC);
+
+-- Keys the app handed out (presign) or started writing (local upload) that are
+-- not in photos yet. Orphan cleanup deletes only these — never "anything in
+-- storage without a row" — so a lost or restored DB can't wipe real photos.
+CREATE TABLE IF NOT EXISTS unconfirmed_uploads (
+    object_key TEXT PRIMARY KEY,
+    issued_at TEXT NOT NULL
+);
 """
 
 
@@ -55,6 +67,25 @@ class PhotoRepository:
         for name, decl in additions.items():
             if name not in existing:
                 await db.execute(f"ALTER TABLE photos ADD COLUMN {name} {decl}")
+        await self._decode_guest_names(db)
+
+    async def _decode_guest_names(self, db: aiosqlite.Connection) -> None:
+        """Fix names stored percent-encoded (%D0%9F...) before the cookie was decoded."""
+        cursor = await db.execute(
+            "SELECT DISTINCT guest_name FROM photos WHERE guest_name LIKE '%!%%' ESCAPE '!'"
+        )
+        for (name,) in await cursor.fetchall():
+            if not _PERCENT_ESCAPE.search(name):
+                continue
+            try:
+                decoded = unquote(name, errors="strict")
+            except UnicodeDecodeError:
+                continue  # not our encoding — leave the name as is
+            if decoded != name:
+                await db.execute(
+                    "UPDATE photos SET guest_name = ? WHERE guest_name = ?",
+                    (decoded, name),
+                )
 
     async def add(
         self,
@@ -176,10 +207,16 @@ class PhotoRepository:
         pending: bool | None = None,
         kind: str = "all",
         guest: str | None = None,
+        before: tuple[str, int] | None = None,
     ) -> list[dict[str, Any]]:
+        """Newest first. ``before`` = (uploaded_at, id) of the last row already
+        shown (keyset pagination: unaffected by rows added or removed meanwhile)."""
         where, params = self._filters(
             hidden=hidden, pending=pending, kind=kind, guest=guest
         )
+        if before is not None:
+            where.append("(uploaded_at, id) < (?, ?)")
+            params += [before[0], before[1]]
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
                    client_ip, guest_name, hidden, pending, thumb_width,
@@ -222,9 +259,10 @@ class PhotoRepository:
     ) -> list[dict[str, Any]]:
         """All rows (no pagination) — used for backfill / maintenance."""
         where, params = self._filters(kind=kind, hidden=hidden, pending=pending)
-        sql = "SELECT id, object_key, content_type FROM photos"
+        sql = "SELECT id, object_key, content_type, size_bytes, uploaded_at FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY uploaded_at, id"
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(sql, params)
@@ -276,6 +314,44 @@ class PhotoRepository:
             await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
             await db.commit()
         return row
+
+
+    async def track_unconfirmed(self, keys: list[str], issued_at: str) -> None:
+        """Remember keys handed out for upload until they are confirmed."""
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO unconfirmed_uploads (object_key, issued_at) VALUES (?, ?)",
+                [(key, issued_at) for key in keys],
+            )
+            await db.commit()
+
+    async def untrack_unconfirmed(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "DELETE FROM unconfirmed_uploads WHERE object_key = ?",
+                [(key,) for key in keys],
+            )
+            await db.commit()
+
+    async def stale_unconfirmed(self, issued_before: str, limit: int) -> list[str]:
+        """Tracked keys issued before the cutoff that never became a photo (oldest first)."""
+        async with aiosqlite.connect(self.database_path) as db:
+            # Confirmed but not untracked (e.g. crash in between) — just forget them.
+            await db.execute(
+                "DELETE FROM unconfirmed_uploads"
+                " WHERE object_key IN (SELECT object_key FROM photos)"
+            )
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT object_key FROM unconfirmed_uploads"
+                " WHERE issued_at < ? ORDER BY issued_at LIMIT ?",
+                (issued_before, limit),
+            )
+            return [row[0] for row in await cursor.fetchall()]
 
 
 def resolve_db_path(path: str) -> str:

@@ -44,6 +44,18 @@ class RateLimiter:
             remaining = self._limit - len(bucket)
             return True, remaining
 
+    def blocked(self, key: str, now: float | None = None) -> bool:
+        """True when ``key`` has used up its window. Checks without consuming."""
+        ts = time.time() if now is None else now
+        window_start = ts - 60.0
+        with self._lock:
+            bucket = self._hits.get(key)
+            if not bucket:
+                return False
+            while bucket and bucket[0] < window_start:
+                bucket.popleft()
+            return len(bucket) >= self._limit
+
     def reset(self) -> None:
         with self._lock:
             self._hits.clear()

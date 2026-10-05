@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
+import io
 import logging
-import tempfile
+import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated, Any, AsyncIterator, Union
-from zipfile import ZIP_STORED, ZipFile
+from typing import Annotated, Any, AsyncIterator, Iterator, Union
+from urllib.parse import unquote
+from zipfile import ZIP_STORED, ZipFile, ZipInfo
 
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -22,7 +26,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import (
@@ -34,11 +38,12 @@ from app.config import (
 from app.db import PhotoRepository, resolve_db_path
 from app.filetype import SNIFF_BYTES, content_matches
 from app.maintenance import maintenance_loop
-from app.poster import generate_poster_from_bytes, generate_poster_from_path
+from app.poster import generate_poster_from_path, generate_poster_from_url
 from app.rate_limit import RateLimiter
 from app.thumbnails import image_dimensions, sanitize_original
 from app.schemas import (
     AdminListResponse,
+    ArchiveTokenResponse,
     AdminPhotoOut,
     ConfirmRequest,
     ConfirmResponse,
@@ -222,7 +227,8 @@ _GUEST_NAME_MAX = 80
 
 def _guest_name(request: Request) -> str:
     """Read the remembered guest name from the cookie, sanitized and length-capped."""
-    raw = (request.cookies.get("guest_name") or "").strip()
+    # The frontend stores the name with encodeURIComponent (Cyrillic -> %D0%9F...).
+    raw = unquote((request.cookies.get("guest_name") or "").strip())
     cleaned = "".join(ch for ch in raw if ch.isprintable() and ch not in "\r\n\t")
     return cleaned[:_GUEST_NAME_MAX]
 
@@ -266,7 +272,8 @@ def require_admin(
 ) -> None:
     """Reject admin calls unless the correct password is presented as a bearer token.
 
-    Also rate-limits per (real) IP so the password can't be brute-forced quickly.
+    Only failed attempts count against the per-IP admin limiter, so normal
+    moderation (many requests a minute) is never throttled.
     """
     password = settings.admin_password
     if not password:
@@ -274,29 +281,36 @@ def require_admin(
             status_code=503,
             detail="Админка отключена. Задайте ADMIN_PASSWORD в .env.",
         )
-    header = request.headers.get("Authorization", "")
-    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
-    if not token or not hmac.compare_digest(token, password):
-        # Count failed attempts against the tight admin limiter too.
-        enforce_admin_rate_limit(request, settings)
-        raise HTTPException(status_code=401, detail="Неверный пароль администратора.")
-    enforce_admin_rate_limit(request, settings)
-
-
-def enforce_admin_rate_limit(request: Request, settings: Settings) -> None:
     limiter = get_admin_limiter()
-    allowed, _remaining = limiter.allow(client_ip(request, settings.trusted_proxies))
-    if not allowed:
+    ip = client_ip(request, settings.trusted_proxies)
+    # Checked before the password: once an IP is blocked even a correct guess
+    # gets 429, so the response can't confirm it.
+    if limiter.blocked(ip):
         raise HTTPException(
             status_code=429,
             detail="Слишком много попыток входа. Подождите минуту.",
         )
+    header = request.headers.get("Authorization", "")
+    token = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    if not token or not hmac.compare_digest(token, password):
+        limiter.allow(ip)
+        raise HTTPException(status_code=401, detail="Неверный пароль администратора.")
 
 
 def _thumb_url_for(row: dict[str, Any], storage: Storage, base: str) -> str | None:
     if kind_of(row["content_type"]) == "image":
         return storage.thumb_url(row["object_key"], base)
     return None
+
+
+def _uses_media_redirect(storage: Storage) -> bool:
+    """Signed bucket URLs change on every request, which defeats the browser
+    cache and expires open pages. Such files go through /api/media instead."""
+    return (
+        isinstance(storage, YandexStorage)
+        and not storage.settings.public_read
+        and not storage.settings.s3_mock
+    )
 
 
 def _build_photo(
@@ -309,6 +323,22 @@ def _build_photo(
     key = row["object_key"]
     content_type = row["content_type"]
     kind = kind_of(content_type)
+    if not admin and _uses_media_redirect(storage):
+        media = f"{base}/api/media/{row['id']}"
+        return {
+            "id": row["id"],
+            "key": key,
+            "content_type": content_type,
+            "kind": kind,
+            "size_bytes": row["size_bytes"],
+            "uploaded_at": row["uploaded_at"],
+            "url": f"{media}/original",
+            "thumb_url": f"{media}/thumb" if kind == "image" else None,
+            "thumb_width": row.get("thumb_width"),
+            "thumb_height": row.get("thumb_height"),
+            "display_url": f"{media}/display" if kind == "image" else None,
+            "poster_url": f"{media}/poster" if kind == "video" else None,
+        }
     payload: dict[str, Any] = {
         "id": row["id"],
         "key": key,
@@ -446,12 +476,13 @@ def _make_local_poster(
 def _make_yandex_poster(
     yandex: YandexStorage, key: str, ffmpeg: str
 ) -> bool:
-    """Download a bucket video once and extract a poster frame (best-effort)."""
+    """Extract a poster frame from a bucket video (best-effort).
+
+    ffmpeg reads the object over a signed URL with HTTP range requests, so only
+    the bytes it needs are fetched — the video is never downloaded whole.
+    """
     try:
-        data = yandex.get_bytes(key)
-        if not data:
-            return False
-        poster = generate_poster_from_bytes(data, ffmpeg)
+        poster = generate_poster_from_url(yandex.photo_url(key), ffmpeg)
         if not poster:
             return False
         return yandex.save_poster(key, poster)
@@ -460,39 +491,123 @@ def _make_yandex_poster(
         return False
 
 
-def _unlink_later(path: str) -> None:
+def _encode_cursor(row: dict[str, Any]) -> str:
+    raw = f"{row['uploaded_at']}|{row['id']}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, int]:
     try:
-        Path(path).unlink(missing_ok=True)
-    except OSError:
-        pass
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+        uploaded_at, photo_id = raw.rsplit("|", 1)
+        return uploaded_at, int(photo_id)
+    except (binascii.Error, UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Неверный курсор страницы.") from exc
 
 
-def _build_archive(storage: Storage, rows: list[dict[str, Any]]) -> str | None:
-    """Zip all visible originals into a temp file; returns its path or None."""
-    if not rows:
-        return None
-    tmp = tempfile.NamedTemporaryFile(
-        prefix="wedding-archive-", suffix=".zip", delete=False
+async def _page(
+    repo: PhotoRepository,
+    *,
+    limit: int,
+    offset: int,
+    cursor: str | None,
+    **filters: Any,
+) -> tuple[list[dict[str, Any]], bool, str | None]:
+    """One page plus has_more/next_cursor. A cursor wins over offset."""
+    before = _decode_cursor(cursor) if cursor else None
+    rows = await repo.list_recent(
+        limit=limit + 1, offset=0 if before else offset, before=before, **filters
     )
-    tmp_path = tmp.name
-    tmp.close()
-    with ZipFile(tmp_path, "w", compression=ZIP_STORED) as zf:
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = _encode_cursor(rows[-1]) if has_more and rows else None
+    return rows, has_more, next_cursor
+
+
+# Redirects to signed URLs are cached by the browser for at most this long
+# (and never longer than half the signature lifetime).
+_MEDIA_REDIRECT_MAX_AGE = 6 * 3600
+
+_ARCHIVE_TOKEN_TTL = 300
+_ARCHIVE_CHUNK = 1024 * 1024
+# One-time download tokens: a plain link can't carry the Authorization header.
+_archive_tokens: dict[str, float] = {}
+
+
+def _issue_archive_token() -> str:
+    now = time.monotonic()
+    for token, expires in list(_archive_tokens.items()):
+        if expires < now:
+            _archive_tokens.pop(token, None)
+    token = secrets.token_urlsafe(32)
+    _archive_tokens[token] = now + _ARCHIVE_TOKEN_TTL
+    return token
+
+
+def _consume_archive_token(token: str) -> bool:
+    expires = _archive_tokens.pop(token, None)
+    return expires is not None and expires >= time.monotonic()
+
+
+class _ZipSink(io.RawIOBase):
+    """Unseekable sink: ZipFile writes into it, the response drains it."""
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, data) -> int:  # noqa: ANN001 — bytes-like from zipfile
+        self._chunks.append(bytes(data))
+        return len(data)
+
+    def drain(self) -> bytes:
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+def _zip_time(uploaded_at: str) -> tuple[int, int, int, int, int, int]:
+    try:
+        moment = datetime.fromisoformat(uploaded_at.replace("Z", "+00:00"))
+    except ValueError:
+        return (1980, 1, 1, 0, 0, 0)
+    return moment.timetuple()[:6] if moment.year >= 1980 else (1980, 1, 1, 0, 0, 0)
+
+
+def _iter_archive(storage: Storage, rows: list[dict[str, Any]]) -> Iterator[bytes]:
+    """Build the ZIP on the fly (stored, no compression) while it is being sent.
+
+    Nothing is buffered beyond one chunk: no temp file, no whole archive in RAM.
+    Runs in Starlette's threadpool (sync generator), so blocking reads are fine.
+    """
+    sink = _ZipSink()
+    with ZipFile(sink, "w", compression=ZIP_STORED, allowZip64=True) as zf:
         for row in rows:
             key = row["object_key"]
-            arcname = key.replace("uploads/", "", 1)
-            if isinstance(storage, LocalStorage):
-                try:
-                    src = storage.absolute_path(key)
-                except ValueError:
-                    continue
-                if not src.is_file():
-                    continue
-                zf.write(src, arcname)
-            else:
-                data = storage.get_bytes(key)
-                if data:
-                    zf.writestr(arcname, data)
-    return tmp_path
+            try:
+                chunks = storage.iter_bytes(key, _ARCHIVE_CHUNK)
+            except Exception:
+                logger.exception("Не удалось добавить %s в архив", key)
+                continue
+            info = ZipInfo(key.replace("uploads/", "", 1), _zip_time(row["uploaded_at"]))
+            info.compress_type = ZIP_STORED
+            big = (row.get("size_bytes") or 0) > 1024 ** 3
+            try:
+                with zf.open(info, "w", force_zip64=big) as entry:
+                    for chunk in chunks:
+                        entry.write(chunk)
+                        out = sink.drain()
+                        if out:
+                            yield out
+            except Exception:
+                # A broken read can't be undone mid-stream; the entry ends short.
+                logger.exception("Архив: обрыв чтения %s", key)
+            out = sink.drain()
+            if out:
+                yield out
+    yield sink.drain()
 
 
 def _register_routes(api: FastAPI) -> None:
@@ -582,6 +697,8 @@ def _register_routes(api: FastAPI) -> None:
                 )
 
             key = build_object_key(content_type)
+            # Ledger entry covers a crash between writing the file and the DB row.
+            await repo.track_unconfirmed([key], now)
             dims: tuple[int, int] | None = None
             if kind_of(content_type) == "image":
                 data, dims = await asyncio.to_thread(
@@ -609,6 +726,7 @@ def _register_routes(api: FastAPI) -> None:
                 display_width=dims[0] if dims else None,
                 display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([key])
             if row:
                 saved.append(
                     UploadedPhoto(
@@ -644,6 +762,7 @@ def _register_routes(api: FastAPI) -> None:
         settings: Annotated[Settings, Depends(get_settings)],
         limiter: Annotated[RateLimiter, Depends(get_limiter)],
         storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> PresignResponse:
         """Issue browser POST policies for Yandex Object Storage."""
         yandex = _require_yandex(storage)
@@ -699,6 +818,10 @@ def _register_routes(api: FastAPI) -> None:
                     fields=signed["fields"],
                 )
             )
+        # Only these keys may ever be removed by orphan cleanup (if never confirmed).
+        await repo.track_unconfirmed(
+            [item.key for item in items], datetime.now(timezone.utc).isoformat()
+        )
         return PresignResponse(items=items)
 
     @api.post("/api/uploads/confirm", response_model=ConfirmResponse)
@@ -756,6 +879,8 @@ def _register_routes(api: FastAPI) -> None:
                         detail=f"Объект «{file_in.key}» не найден в бакете.",
                     )
                 if reason == "mismatch":
+                    # The object was deleted right away; nothing left to clean up.
+                    await repo.untrack_unconfirmed([file_in.key])
                     raise HTTPException(status_code=400, detail=_not_media_detail(None))
                 raise HTTPException(status_code=400, detail="Не удалось прочитать объект.")
 
@@ -782,6 +907,7 @@ def _register_routes(api: FastAPI) -> None:
                 display_width=dims[0] if dims else None,
                 display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([file_in.key])
             if row:
                 saved.append(
                     UploadedPhoto(
@@ -819,6 +945,7 @@ def _register_routes(api: FastAPI) -> None:
         offset: int = 0,
         kind: str = "all",
         guest: str | None = None,
+        cursor: str | None = None,
     ) -> PhotoListResponse:
         # Public gallery is deliberately NOT rate-limited: guests on one network
         # shouldn't be blocked, and the endpoint is cheap (metadata only).
@@ -826,15 +953,11 @@ def _register_routes(api: FastAPI) -> None:
         offset = max(0, offset)
         if kind not in ("all", "image", "video"):
             kind = "all"
-        rows = await repo.list_recent(
-            limit=limit,
-            offset=offset,
-            hidden=False,
-            pending=False,
-            kind=kind,
-            guest=guest or None,
+        filters = {"hidden": False, "pending": False, "kind": kind, "guest": guest or None}
+        rows, has_more, next_cursor = await _page(
+            repo, limit=limit, offset=offset, cursor=cursor, **filters
         )
-        total = await repo.count(hidden=False, pending=False, kind=kind, guest=guest or None)
+        total = await repo.count(**filters)
         base = settings.base_path
         items = [_build_photo(row, storage, base) for row in rows]
         return PhotoListResponse(
@@ -842,7 +965,44 @@ def _register_routes(api: FastAPI) -> None:
             total=total,
             limit=limit,
             offset=offset,
-            has_more=offset + len(items) < total,
+            has_more=has_more,
+            next_cursor=next_cursor,
+        )
+
+    @api.get("/api/media/{photo_id}/{variant}")
+    async def media_redirect(
+        photo_id: int,
+        variant: str,
+        settings: Annotated[Settings, Depends(get_settings)],
+        storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> RedirectResponse:
+        """Stable gallery URL: 302 to a fresh signed URL for the file.
+
+        The redirect itself is cacheable, so the browser keeps reusing one signed
+        URL (and the image cached under it) instead of a new one per page load,
+        and an open page never ends up with expired links.
+        """
+        row = await repo.get_by_id(photo_id)
+        if row is None or row.get("hidden") or row.get("pending"):
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        key = row["object_key"]
+        kind = kind_of(row["content_type"])
+        if variant == "original":
+            target = key
+        elif variant == "thumb" and kind == "image":
+            target = storage.thumb_key(key)
+        elif variant == "display" and kind == "image":
+            target = storage.display_key(key)
+        elif variant == "poster" and kind == "video":
+            target = storage.poster_key(key)
+        else:
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        max_age = max(60, min(_MEDIA_REDIRECT_MAX_AGE, settings.presign_expires_seconds // 2))
+        return RedirectResponse(
+            storage.photo_url(target, settings.base_path),
+            status_code=302,
+            headers={"Cache-Control": f"private, max-age={max_age}"},
         )
 
     @api.get("/api/photos/guests", response_model=GuestsResponse)
@@ -876,21 +1036,18 @@ def _register_routes(api: FastAPI) -> None:
         hidden: bool | None = None,
         pending: bool | None = None,
         guest: str | None = None,
+        cursor: str | None = None,
     ) -> AdminListResponse:
         require_admin(request, settings)
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
         if kind not in ("all", "image", "video"):
             kind = "all"
-        rows = await repo.list_recent(
-            limit=limit,
-            offset=offset,
-            hidden=hidden,
-            pending=pending,
-            kind=kind,
-            guest=guest or None,
+        filters = {"hidden": hidden, "pending": pending, "kind": kind, "guest": guest or None}
+        rows, has_more, next_cursor = await _page(
+            repo, limit=limit, offset=offset, cursor=cursor, **filters
         )
-        total = await repo.count(hidden=hidden, pending=pending, kind=kind, guest=guest or None)
+        total = await repo.count(**filters)
         base = settings.base_path
         items = [_build_photo(row, storage, base, admin=True) for row in rows]
         return AdminListResponse(
@@ -898,7 +1055,8 @@ def _register_routes(api: FastAPI) -> None:
             total=total,
             limit=limit,
             offset=offset,
-            has_more=offset + len(items) < total,
+            has_more=has_more,
+            next_cursor=next_cursor,
         )
 
     @api.patch("/api/admin/photos/{photo_id}", response_model=AdminPhotoOut)
@@ -951,26 +1109,46 @@ def _register_routes(api: FastAPI) -> None:
         await repo.delete(photo_id)
         return DeleteResponse(ok=True)
 
+    @api.post("/api/admin/photos/archive-token", response_model=ArchiveTokenResponse)
+    async def admin_archive_token(
+        request: Request,
+        settings: Annotated[Settings, Depends(get_settings)],
+    ) -> ArchiveTokenResponse:
+        """One-time link token, so the browser can download the archive natively."""
+        require_admin(request, settings)
+        return ArchiveTokenResponse(token=_issue_archive_token(), expires_in=_ARCHIVE_TOKEN_TTL)
+
     @api.get("/api/admin/photos/archive.zip")
     async def admin_download_archive(
         request: Request,
-        background_tasks: BackgroundTasks,
         settings: Annotated[Settings, Depends(get_settings)],
         storage: Annotated[Storage, Depends(get_storage)],
         repo: Annotated[PhotoRepository, Depends(get_repo)],
-    ) -> FileResponse:
-        """Zip of every visible original — the couple's "all photos" backup."""
-        require_admin(request, settings)
+        token: str | None = None,
+    ) -> StreamingResponse:
+        """Zip of every visible original — the couple's "all photos" backup.
+
+        Streamed while it is built, so size and proxy timeouts don't matter.
+        Auth: one-time ``?token=`` (plain link) or the admin bearer header.
+        """
+        if token is not None:
+            if not _consume_archive_token(token):
+                raise HTTPException(status_code=401, detail="Ссылка на архив устарела.")
+        else:
+            require_admin(request, settings)
         rows = await repo.list_all(hidden=False, pending=False)
-        path = await asyncio.to_thread(_build_archive, storage, rows)
-        if path is None:
+        if not rows:
             raise HTTPException(status_code=404, detail="Нет опубликованных фото.")
-        background_tasks.add_task(_unlink_later, path)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
-        return FileResponse(
-            path,
+        return StreamingResponse(
+            _iter_archive(storage, rows),
             media_type="application/zip",
-            filename=f"wedding-photos-{stamp}.zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="wedding-photos-{stamp}.zip"',
+                "Cache-Control": "no-store",
+                # nginx/NPM: pass bytes through instead of buffering the archive.
+                "X-Accel-Buffering": "no",
+            },
         )
 
     @api.get("/api/files/{key:path}")

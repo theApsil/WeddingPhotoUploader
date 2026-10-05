@@ -19,8 +19,8 @@ APP_PORT="${WP_APP_PORT:-8200}"
 SERVICE_NAME="${WP_SERVICE_NAME:-photo-upload}"
 LETSENCRYPT_EMAIL="${WP_LETSENCRYPT_EMAIL:-}"
 ENABLE_HTTPS="${WP_ENABLE_HTTPS:-ask}"
-MAX_FILE_SIZE_MB="${WP_MAX_FILE_SIZE_MB:-15}"
-MAX_VIDEO_SIZE_MB="${WP_MAX_VIDEO_SIZE_MB:-200}"
+MAX_FILE_SIZE_MB="${WP_MAX_FILE_SIZE_MB:-40}"
+MAX_VIDEO_SIZE_MB="${WP_MAX_VIDEO_SIZE_MB:-500}"
 MAX_FILES_PER_REQUEST="${WP_MAX_FILES_PER_REQUEST:-10}"
 RATE_LIMIT_PER_MINUTE="${WP_RATE_LIMIT_PER_MINUTE:-20}"
 YANDEX_ACCESS_KEY_ID="${WP_YANDEX_ACCESS_KEY_ID:-}"
@@ -54,8 +54,8 @@ Non-interactive variables (examples):
   WP_LETSENCRYPT_EMAIL=admin@example.com
   WP_ENABLE_HTTPS=yes|no
   WP_APP_PORT=8200
-  WP_MAX_FILE_SIZE_MB=15
-  WP_MAX_VIDEO_SIZE_MB=200
+  WP_MAX_FILE_SIZE_MB=40
+  WP_MAX_VIDEO_SIZE_MB=500
   WP_YANDEX_ACCESS_KEY_ID=...
   WP_YANDEX_SECRET_ACCESS_KEY=...
   WP_S3_BUCKET=...
@@ -274,29 +274,6 @@ LETSENCRYPT_EMAIL=${LETSENCRYPT_EMAIL}
 # scheme hint for docs: ${scheme}
 EOF
   log "Записан ${env_path} (режим 600)"
-}
-
-set_frontend_base_path() {
-  local content="${BASE_PATH}"
-  local file
-  for file in "${PROJECT_ROOT}/frontend/index.html" \
-              "${PROJECT_ROOT}/frontend/gallery.html"; do
-    [[ -f "${file}" ]] || continue
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "DRY-RUN: would set meta base-path='${content}' in ${file}"
-      continue
-    fi
-    if grep -q 'name="base-path"' "${file}"; then
-      sed -i -E \
-        "s|(name=\"base-path\" content=\")[^\"]*(\")|\\1${content}\\2|" \
-        "${file}"
-    else
-      sed -i \
-        "s|<meta name=\"theme-color\"|<meta name=\"base-path\" content=\"${content}\">\n  <meta name=\"theme-color\"|" \
-        "${file}"
-    fi
-  done
-  log "meta base-path=${content:-'(root)'} в HTML"
 }
 
 render_template() {
@@ -619,7 +596,6 @@ main() {
   install_packages
   setup_venv
   write_env_file
-  set_frontend_base_path
   write_systemd_unit
   write_nginx_config
   maybe_certbot

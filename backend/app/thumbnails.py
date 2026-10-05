@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
 try:  # Pillow is required for derived images; fail gracefully when missing.
     from PIL import Image, ImageOps
+
+    # Pillow refuses images above 2x this as "decompression bombs"; the default
+    # (~179 MP hard limit) rejects 200 MP phone shots (16320x12240 = 200 MP).
+    Image.MAX_IMAGE_PIXELS = 250_000_000
 except Exception:  # pragma: no cover - optional dependency
     Image = None  # type: ignore[assignment]
     ImageOps = None  # type: ignore[assignment]
@@ -110,18 +114,6 @@ def generate_display(data: bytes, size: int = 1920) -> bytes | None:
         return None
 
 
-def sanitize_image(data: bytes) -> bytes | None:
-    """Re-encode an original to EXIF-free JPEG (keeps size) or None when undecodable."""
-    if not data:
-        return None
-    try:
-        img = _open_image(data)
-        return _save_jpeg(_to_rgb(img), quality=90)
-    except Exception:
-        logger.warning("Не удалось очистить EXIF (%s байт)", len(data), exc_info=True)
-        return None
-
-
 # JPEG APP markers that carry metadata worth dropping: EXIF, ICC, Photoshop/IPTX.
 _DROP_MARKERS = {0xE1, 0xE2, 0xED}
 
@@ -165,12 +157,15 @@ def strip_exif_jpeg(data: bytes) -> bytes | None:
 def sanitize_original(data: bytes, content_type: str) -> bytes | None:
     """Remove EXIF/GPS from an original while keeping quality.
 
-    JPEG is stripped losslessly; HEIC/HEIF are re-encoded to EXIF-free JPEG.
+    Only JPEG is touched (stripped losslessly). HEIC/HEIF and everything else
+    is never re-encoded: the original must stay byte-for-byte — a JPEG stored
+    under a .heic key with image/heic type confused viewers and lost quality.
+    Thumbnails and display JPEGs carry no EXIF anyway.
     None means "nothing to change" (caller keeps the original).
     """
     if content_type == "image/jpeg":
         return strip_exif_jpeg(data)
-    return sanitize_image(data)
+    return None
 
 
 def image_dimensions(data: bytes) -> tuple[int, int] | None:

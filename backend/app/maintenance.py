@@ -6,6 +6,7 @@ skipped rather than taking the service down.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 import time
@@ -66,79 +67,66 @@ def _cutoff(age_hours: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(hours=age_hours)
 
 
-async def cleanup_orphans(repo: PhotoRepository, storage, age_hours: int) -> int:
-    """Delete stored objects that have no DB row and are older than age_hours.
+# Even the ledger can't justify a mass delete in one go; the rest waits for the
+# next pass and the warning shows up in the log.
+MAX_ORPHANS_PER_PASS = 200
 
-    This removes the "presign but never confirm" junk: browsers that requested a
-    signed upload URL but aborted, leaving orphaned objects in the bucket.
+
+async def cleanup_orphans(
+    repo: PhotoRepository,
+    storage,
+    age_hours: int,
+    max_per_pass: int = MAX_ORPHANS_PER_PASS,
+) -> int:
+    """Delete uploads the app handed out but that were never confirmed.
+
+    Only keys from the ``unconfirmed_uploads`` ledger older than ``age_hours``
+    are touched. Objects the app never issued, or whose rows exist, are never
+    deleted — so a lost or rolled-back DB can't wipe the gallery.
     Returns the number of objects removed.
     """
     if age_hours <= 0:
         return 0
-    rows = await repo.list_all()
-    known = {r["object_key"] for r in rows}
-    cutoff = _cutoff(age_hours)
-
-    if isinstance(storage, LocalStorage):
-        return _cleanup_local_orphans(storage, known, cutoff)
-    if isinstance(storage, YandexStorage):
-        return _cleanup_yandex_orphans(storage, known, cutoff)
-    return 0
-
-
-def _cleanup_local_orphans(
-    storage: LocalStorage, known: set[str], cutoff: datetime
-) -> int:
-    uploads = storage.root / "uploads"
-    if not uploads.is_dir():
+    cutoff = _cutoff(age_hours).isoformat()
+    keys = await repo.stale_unconfirmed(cutoff, limit=max_per_pass)
+    if not keys:
         return 0
-    removed = 0
-    for path in uploads.rglob("*"):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(storage.root).as_posix()
-        if rel in known:
-            continue
-        try:
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-        except OSError:
-            continue
-        if mtime < cutoff:
-            try:
-                path.unlink()
-                removed += 1
-            except OSError:
-                logger.warning("Не удалось удалить осиротевший объект %s", rel)
-    if removed:
-        logger.info("Удалено осиротевших локальных объектов: %s", removed)
-    return removed
+    if len(keys) >= max_per_pass:
+        logger.warning(
+            "Неподтверждённых загрузок больше %s — удаляю первые, остальные в следующий проход",
+            max_per_pass,
+        )
+    # Blocking I/O (filesystem or boto3) — keep it off the event loop.
+    gone = await asyncio.to_thread(_delete_unconfirmed, storage, keys)
+    await repo.untrack_unconfirmed(gone)
+    if gone:
+        logger.info("Удалено неподтверждённых загрузок: %s", len(gone))
+    return len(gone)
 
 
-def _cleanup_yandex_orphans(
-    storage: YandexStorage, known: set[str], cutoff: datetime
-) -> int:
-    if storage.settings.s3_mock:
-        return 0
-    client = storage._get_client()
-    bucket = storage.settings.s3_bucket
-    paginator = client.get_paginator("list_objects_v2")
-    removed = 0
-    try:
-        for page in paginator.paginate(Bucket=bucket, Prefix="uploads/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key in known:
-                    continue
-                last = obj.get("LastModified")
-                if last is not None and last.replace(tzinfo=timezone.utc) < cutoff:
-                    client.delete_object(Bucket=bucket, Key=key)
-                    removed += 1
-    except Exception:
-        logger.exception("Не удалось вычистить осиротевшие объекты в бакете")
-        return removed
-    if removed:
-        logger.info("Удалено осиротевших объектов в бакете: %s", removed)
-    return removed
+def _delete_unconfirmed(storage, keys: list[str]) -> list[str]:
+    """Delete each key if present; return the keys that are now gone."""
+    gone: list[str] = []
+    for key in keys:
+        if isinstance(storage, LocalStorage):
+            if storage.exists(key) and not storage.delete(key):
+                continue
+            # A crash between saving and the DB insert may have left derivatives.
+            for derived in (
+                storage.thumb_key(key),
+                storage.display_key(key),
+                storage.poster_key(key),
+            ):
+                if storage.exists(derived):
+                    storage.delete(derived)
+            gone.append(key)
+        elif isinstance(storage, YandexStorage):
+            # Never uploaded at all — nothing to delete (and with versioning a
+            # delete of a missing key would only leave a stray delete marker).
+            if storage.object_exists(key) and not storage.delete(key):
+                continue  # delete failed and was logged; retry next pass
+            gone.append(key)
+    return gone
 
 
 def ensure_bucket_versioning(storage) -> bool:
@@ -147,9 +135,15 @@ def ensure_bucket_versioning(storage) -> bool:
         return False
     if storage.settings.s3_mock:
         return False
+    client = storage._get_client()
+    bucket = storage.settings.s3_bucket
     try:
-        storage._get_client().put_bucket_versioning(
-            Bucket=storage.settings.s3_bucket,
+        # Usually enabled once in the console; reading it needs fewer rights
+        # than PutBucketVersioning, so don't log AccessDenied on every pass.
+        if client.get_bucket_versioning(Bucket=bucket).get("Status") == "Enabled":
+            return True
+        client.put_bucket_versioning(
+            Bucket=bucket,
             VersioningConfiguration={"Status": "Enabled"},
         )
         logger.info("Версионирование бакета включено")
@@ -162,10 +156,10 @@ def ensure_bucket_versioning(storage) -> bool:
 async def run_once(repo: PhotoRepository, storage, settings: Settings) -> None:
     """Run a full maintenance pass."""
     if isinstance(storage, YandexStorage) and not storage.settings.s3_mock:
-        ensure_bucket_versioning(storage)
+        await asyncio.to_thread(ensure_bucket_versioning, storage)
     await cleanup_orphans(repo, storage, settings.orphan_max_age_hours)
     if settings.backup_hours > 0:
-        backup_sqlite(settings)
+        await asyncio.to_thread(backup_sqlite, settings)
 
 
 async def maintenance_loop(
@@ -175,16 +169,9 @@ async def maintenance_loop(
     interval = settings.backup_hours * 3600
     if interval <= 0:
         interval = 3600  # still allow orphan cleanup / versioning on a sane cadence
-    await run_once(repo, storage, settings)
     while True:
-        await asyncio_sleep(interval)
         try:
             await run_once(repo, storage, settings)
         except Exception:
             logger.exception("Сбой фонового обслуживания")
-
-
-async def asyncio_sleep(seconds: float) -> None:
-    import asyncio
-
-    await asyncio.sleep(seconds)
+        await asyncio.sleep(interval)

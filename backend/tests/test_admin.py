@@ -173,3 +173,53 @@ def test_admin_brute_force_rate_limited(admin_client):
     statuses = {admin_client.get("/api/admin/photos", headers=bad).status_code for _ in range(15)}
     assert 401 in statuses
     assert 429 in statuses
+
+def test_cyrillic_guest_name_cookie_is_decoded(admin_client):
+    """The frontend writes the cookie with encodeURIComponent."""
+    from urllib.parse import quote
+
+    admin_client.cookies.set("guest_name", quote("Пупуня"))
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == "Пупуня"
+    guests = admin_client.get("/api/photos/guests").json()["guests"]
+    assert guests == ["Пупуня"]
+
+
+async def test_percent_encoded_names_fixed_on_startup(tmp_path):
+    """Rows saved before the fix get their names decoded by the migration."""
+    import aiosqlite
+
+    from app.db import PhotoRepository
+
+    repo = PhotoRepository(str(tmp_path / "photos.db"))
+    await repo.init()
+    for i, name in enumerate(["%D0%9F%D1%83%D0%BF%D1%83%D0%BD%D1%8F", "100%", "Ivan"]):
+        await repo.add(
+            object_key=f"uploads/2026-10-05/{i}.jpg",
+            content_type="image/jpeg",
+            size_bytes=1,
+            uploaded_at="2026-10-05T00:00:00+00:00",
+            client_ip="",
+            guest_name=name,
+        )
+    await repo.init()  # restart runs the migration again
+    async with aiosqlite.connect(repo.database_path) as db:
+        rows = await (await db.execute("SELECT guest_name FROM photos ORDER BY id")).fetchall()
+    assert [r[0] for r in rows] == ["Пупуня", "100%", "Ivan"]
+
+
+def test_admin_successful_requests_not_rate_limited(admin_client):
+    """Moderation makes many requests a minute — only failures may count."""
+    statuses = {
+        admin_client.get("/api/admin/photos", headers=_auth()).status_code for _ in range(25)
+    }
+    assert statuses == {200}
+
+
+def test_blocked_ip_gets_429_even_with_correct_password(admin_client):
+    """Once blocked, a right guess must not be distinguishable from a wrong one."""
+    bad = {"Authorization": "Bearer wrong"}
+    for _ in range(15):
+        admin_client.get("/api/admin/photos", headers=bad)
+    assert admin_client.get("/api/admin/photos", headers=_auth()).status_code == 429

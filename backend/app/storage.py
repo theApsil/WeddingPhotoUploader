@@ -7,7 +7,7 @@ import os
 import uuid
 from datetime import date
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
 from app.config import CONTENT_TYPE_EXTENSION, Settings, is_image, is_video
 from app.thumbnails import (
@@ -22,6 +22,10 @@ from app.thumbnails import (
 )
 
 logger = logging.getLogger("wedding.storage")
+
+# Derived JPEGs never change under the same key, so the browser may keep them
+# for good (private: the gallery sits behind the site password).
+_DERIVED_CACHE = "private, max-age=31536000, immutable"
 
 # S3 error codes that just mean "no such object" — expected, not worth logging.
 _NOT_FOUND_CODES = {"404", "NoSuchKey", "NotFound"}
@@ -112,6 +116,17 @@ class LocalStorage:
             logger.warning("Превью не создано для %s", key)
             return None
         return self.save_bytes(self.thumb_key(key), thumb)
+
+    def iter_bytes(self, key: str, chunk_size: int) -> Iterator[bytes]:
+        """Stream a stored file in chunks (opens it right away: errors surface early)."""
+        handle = self.absolute_path(key).open("rb")
+
+        def chunks() -> Iterator[bytes]:
+            with handle:
+                while chunk := handle.read(chunk_size):
+                    yield chunk
+
+        return chunks()
 
     def display_key(self, key: str) -> str:
         return display_key_for(key)
@@ -317,16 +332,29 @@ class YandexStorage:
             logger.exception("Не удалось прочитать начало %s из бакета", key)
             return None
 
-    def put_bytes(self, key: str, data: bytes, content_type: str = "image/jpeg") -> bool:
+    def iter_bytes(self, key: str, chunk_size: int) -> Iterator[bytes]:
+        """Stream an object in chunks (GET is issued now: errors surface early)."""
+        body = self._get_client().get_object(Bucket=self.settings.s3_bucket, Key=key)["Body"]
+        return body.iter_chunks(chunk_size)
+
+    def put_bytes(
+        self,
+        key: str,
+        data: bytes,
+        content_type: str = "image/jpeg",
+        cache_control: str | None = None,
+    ) -> bool:
         if self.settings.s3_mock:
             return True
         client = self._get_client()
         try:
+            extra = {"CacheControl": cache_control} if cache_control else {}
             client.put_object(
                 Bucket=self.settings.s3_bucket,
                 Key=key,
                 Body=data,
                 ContentType=content_type,
+                **extra,
             )
             return True
         except Exception:
@@ -341,7 +369,7 @@ class YandexStorage:
         if not thumb:
             logger.warning("Превью не создано для %s", key)
             return False
-        return self.put_bytes(self.thumb_key(key), thumb)
+        return self.put_bytes(self.thumb_key(key), thumb, cache_control=_DERIVED_CACHE)
 
     def display_key(self, key: str) -> str:
         return display_key_for(key)
@@ -357,7 +385,7 @@ class YandexStorage:
         if not display:
             logger.warning("Display-версия не создана для %s", key)
             return False
-        return self.put_bytes(self.display_key(key), display)
+        return self.put_bytes(self.display_key(key), display, cache_control=_DERIVED_CACHE)
 
     def poster_key(self, key: str) -> str:
         return poster_key_for(key)
@@ -367,7 +395,7 @@ class YandexStorage:
 
     def save_poster(self, key: str, data: bytes) -> bool:
         """Persist a pre-extracted poster JPEG for a video object."""
-        return self.put_bytes(self.poster_key(key), data)
+        return self.put_bytes(self.poster_key(key), data, cache_control=_DERIVED_CACHE)
 
     def delete(self, key: str) -> bool:
         if self.settings.s3_mock:

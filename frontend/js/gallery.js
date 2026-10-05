@@ -1,4 +1,11 @@
-import { api, applySiteCopy, formatBytes, formatWhen, showAlert } from "./common.js";
+import {
+  api,
+  applySiteCopy,
+  formatBytes,
+  formatWhen,
+  hideHomeForKnownGuest,
+  showAlert,
+} from "./common.js";
 
 const els = {
   grid: document.getElementById("gallery"),
@@ -14,7 +21,7 @@ const els = {
 const PAGE = 48;
 const state = {
   items: [],
-  offset: 0,
+  cursor: null, // next_cursor from the API: where "Показать ещё" continues
   total: 0,
   kind: "all",
   guest: "",
@@ -96,8 +103,10 @@ function guestQuery() {
 }
 
 function renderLoadMore() {
-  const remaining = state.total - state.items.length;
-  if (state.items.length > 0 && remaining > 0) {
+  // Visibility follows the cursor; total may already include newer uploads
+  // that sit above what is shown, so it is only used for the counter.
+  const remaining = Math.max(0, state.total - state.items.length);
+  if (state.items.length > 0 && state.hasMore) {
     els.loadMore.hidden = false;
     els.loadMore.textContent = `Показать ещё · осталось ${remaining}`;
     els.loadMore.disabled = state.loading;
@@ -115,10 +124,19 @@ function render() {
   renderLoadMore();
 }
 
+// In-flight list request; a new filter aborts it so the latest click wins.
+let inflight = null;
+
 async function load(reset = false) {
-  if (state.loading) return;
   if (reset) {
-    state.offset = 0;
+    inflight?.abort();
+  } else if (state.loading) {
+    return; // "Показать ещё" while a page is already coming
+  }
+  const controller = new AbortController();
+  inflight = controller;
+  if (reset) {
+    state.cursor = null;
     state.items = [];
     setStatus("Загружаю…");
     showAlert(els.alert, "", "error");
@@ -128,23 +146,26 @@ async function load(reset = false) {
 
   try {
     const data = await api(
-      `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}${guestQuery()}`,
+      `/api/photos?limit=${PAGE}&kind=${state.kind}${guestQuery()}` +
+        (state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : ""),
+      { signal: controller.signal },
     );
+    if (controller !== inflight) return; // superseded by a newer filter
     state.total = data.total;
     state.hasMore = data.has_more;
     state.items = reset ? data.items : state.items.concat(data.items);
-    state.offset = state.items.length;
+    state.cursor = data.next_cursor;
 
     if (!state.items.length) {
       setStatus("Пока пусто — загрузите фото или видео на странице «Загрузить».", "empty");
-      renderTotal();
-      renderLoadMore();
+      render(); // also clears tiles left over from the previous filter
       return;
     }
 
     setStatus("");
     render();
   } catch (err) {
+    if (controller !== inflight || err.name === "AbortError") return;
     setStatus("", "error-box");
     showAlert(
       els.alert,
@@ -153,7 +174,11 @@ async function load(reset = false) {
     );
     renderLoadMore();
   } finally {
-    state.loading = false;
+    if (controller === inflight) {
+      state.loading = false;
+      inflight = null;
+      renderLoadMore();
+    }
   }
 }
 
@@ -185,6 +210,10 @@ function renderStage() {
     const img = document.createElement("img");
     img.src = item.display_url || item.url;
     img.alt = "Фото со свадьбы";
+    if (item.display_url && item.url) {
+      // Old uploads may have no display JPEG yet — show the original instead.
+      img.addEventListener("error", () => { img.src = item.url; }, { once: true });
+    }
     els.lbStage.appendChild(img);
   }
   const download = document.createElement("a");
@@ -236,8 +265,7 @@ async function step(delta) {
 function bindFilters() {
   document.querySelectorAll(".filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      // Ignore clicks while a request is in flight so the filter isn't lost.
-      if (state.loading) return;
+      // A newer filter aborts the in-flight request inside load(true).
       document.querySelectorAll(".filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;
@@ -248,7 +276,6 @@ function bindFilters() {
   const guestSel = document.getElementById("guest-filter");
   if (guestSel) {
     guestSel.addEventListener("change", () => {
-      if (state.loading) return;
       state.guest = guestSel.value;
       load(true);
     });
@@ -294,6 +321,7 @@ function bindLightbox() {
 }
 
 applySiteCopy();
+hideHomeForKnownGuest();
 bindFilters();
 bindLightbox();
 loadGuests();

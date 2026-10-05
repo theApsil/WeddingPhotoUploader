@@ -1,6 +1,7 @@
 import {
   BASE_PATH,
   applySiteCopy,
+  hideHomeForKnownGuest,
   formatBytes,
   formatWhen,
   showAlert,
@@ -30,7 +31,8 @@ const els = {
 const state = {
   token: sessionStorage.getItem(TOKEN_KEY) || "",
   items: [],
-  offset: 0,
+  cursor: null, // next_cursor from the API
+  hasMore: false,
   total: 0,
   kind: "all",
   guest: "",
@@ -74,14 +76,33 @@ function renderTotal() {
 }
 
 function renderMore() {
-  const remaining = state.total - state.items.length;
-  if (state.items.length > 0 && remaining > 0) {
+  const remaining = Math.max(0, state.total - state.items.length);
+  if (state.items.length > 0 && state.hasMore) {
     els.adminMore.hidden = false;
     els.adminMore.textContent = `Показать ещё · осталось ${remaining}`;
     els.adminMore.disabled = state.loading;
   } else {
     els.adminMore.hidden = true;
   }
+}
+
+/** Does an item still belong to the list under the current filters? */
+function matchesFilters(item) {
+  if (Boolean(item.hidden) !== els.showHidden.checked) return false;
+  if (els.pendingOnly.checked && !item.pending) return false;
+  return true;
+}
+
+/** Apply a PATCH result; drop the row if it left the current filter. */
+function applyUpdate(item, updated) {
+  item.hidden = updated.hidden;
+  item.pending = updated.pending;
+  if (!matchesFilters(item)) {
+    state.items = state.items.filter((it) => it.id !== item.id);
+    state.total = Math.max(0, state.total - 1);
+  }
+  renderList(false);
+  showAlert(els.adminAlert, "", "error");
 }
 
 function rowActions(item, li) {
@@ -100,8 +121,7 @@ function rowActions(item, li) {
           method: "PATCH",
           body: JSON.stringify({ pending: false }),
         });
-        item.pending = updated.pending;
-        renderList(false);
+        applyUpdate(item, updated);
       } catch (err) {
         showAlert(els.adminAlert, `Не удалось одобрить: ${err.message}`, "error");
       }
@@ -117,9 +137,7 @@ function rowActions(item, li) {
           method: "PATCH",
           body: JSON.stringify({ pending: true, hidden: true }),
         });
-        item.pending = updated.pending;
-        item.hidden = updated.hidden;
-        renderList(false);
+        applyUpdate(item, updated);
       } catch (err) {
         showAlert(els.adminAlert, `Не удалось отклонить: ${err.message}`, "error");
       }
@@ -137,9 +155,7 @@ function rowActions(item, li) {
         method: "PATCH",
         body: JSON.stringify({ hidden: !item.hidden }),
       });
-      item.hidden = updated.hidden;
-      renderList(false);
-      showAlert(els.adminAlert, "", "error");
+      applyUpdate(item, updated);
     } catch (err) {
       showAlert(els.adminAlert, `Не удалось обновить: ${err.message}`, "error");
     }
@@ -155,9 +171,6 @@ function rowActions(item, li) {
       await adminFetch(`/api/admin/photos/${item.id}`, { method: "DELETE" });
       state.items = state.items.filter((it) => it.id !== item.id);
       state.total = Math.max(0, state.total - 1);
-      // Recompute offset from what's actually shown so "Показать ещё"
-      // doesn't skip the row that shifted into the deleted item's place.
-      state.offset = state.items.length;
       renderList(false);
       showAlert(els.adminAlert, "", "error");
     } catch (err) {
@@ -215,10 +228,19 @@ function renderList(keepList = true) {
   renderMore();
 }
 
+// In-flight list request; a new filter aborts it so the latest click wins.
+let inflight = null;
+
 async function load(reset = false) {
-  if (state.loading) return;
   if (reset) {
-    state.offset = 0;
+    inflight?.abort();
+  } else if (state.loading) {
+    return; // "Показать ещё" while a page is already coming
+  }
+  const controller = new AbortController();
+  inflight = controller;
+  if (reset) {
+    state.cursor = null;
     state.items = [];
     setStatus("Загружаю…", false);
   }
@@ -229,23 +251,32 @@ async function load(reset = false) {
     const pending = els.pendingOnly.checked ? "true" : "";
     const guest = state.guest ? `&guest=${encodeURIComponent(state.guest)}` : "";
     const data = await adminFetch(
-      `/api/admin/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}` +
+      `/api/admin/photos?limit=${PAGE}&kind=${state.kind}` +
+        (state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : "") +
         `&hidden=${hidden}${pending ? `&pending=${pending}` : ""}${guest}`,
+      { signal: controller.signal },
     );
+    if (controller !== inflight) return; // superseded by a newer filter
     state.total = data.total;
     state.items = reset ? data.items : state.items.concat(data.items);
-    state.offset = state.items.length;
+    state.cursor = data.next_cursor;
+    state.hasMore = data.has_more;
     setStatus("", true);
     renderList(false);
     if (!state.items.length) {
       setStatus("Ничего не найдено.", false);
     }
   } catch (err) {
+    if (controller !== inflight || err.name === "AbortError") return;
     setStatus("", true);
     showAlert(els.adminAlert, `Не получилось загрузить список: ${err.message}`, "error");
     if (err.status === 401) logout();
   } finally {
-    state.loading = false;
+    if (controller === inflight) {
+      state.loading = false;
+      inflight = null;
+      renderMore();
+    }
   }
 }
 
@@ -299,7 +330,6 @@ function bind() {
   els.pendingOnly.addEventListener("change", () => load(true));
   if (els.guestFilter) {
     els.guestFilter.addEventListener("change", () => {
-      if (state.loading) return;
       state.guest = els.guestFilter.value;
       load(true);
     });
@@ -309,8 +339,7 @@ function bind() {
   }
   document.querySelectorAll("#panel .filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
-      // Ignore clicks while a request is in flight so the filter isn't lost.
-      if (state.loading) return;
+      // A newer filter aborts the in-flight request inside load(true).
       document.querySelectorAll("#panel .filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;
@@ -341,24 +370,23 @@ async function loadAdminGuests() {
 
 async function downloadArchive() {
   try {
-    const res = await fetch(`${BASE_PATH}/api/admin/photos/archive.zip`, {
-      headers: { Authorization: `Bearer ${token()}` },
+    // A plain link can't send the Authorization header, so get a one-time
+    // token and let the browser download the (streamed) archive natively —
+    // no blob in memory, real progress, works for gigabytes.
+    const { token: oneTime } = await adminFetch("/api/admin/photos/archive-token", {
+      method: "POST",
     });
-    if (!res.ok) throw new Error(`Ошибка ${res.status}`);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `wedding-photos-${new Date().toISOString().slice(0, 10)}.zip`;
+    a.href = `${BASE_PATH}/api/admin/photos/archive.zip?token=${encodeURIComponent(oneTime)}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
   } catch (err) {
     showAlert(els.adminAlert, `Не удалось скачать архив: ${err.message}`, "error");
   }
 }
 
 applySiteCopy();
+hideHomeForKnownGuest();
 bind();
 showPanel();

@@ -32,3 +32,14 @@ def test_health(client):
     assert "image/jpeg" in data["allowed_types"]
     # Internal storage path must not leak.
     assert "storage_dir" not in data
+
+
+def test_rate_limiter_blocked_does_not_consume():
+    limiter = RateLimiter(limit_per_minute=2)
+    now = 1_000_000.0
+    assert limiter.blocked("ip", now=now) is False
+    assert limiter.blocked("ip", now=now) is False  # peeking twice uses nothing
+    limiter.allow("ip", now=now)
+    limiter.allow("ip", now=now + 1)
+    assert limiter.blocked("ip", now=now + 2) is True
+    assert limiter.blocked("ip", now=now + 61.5) is False  # window slid
