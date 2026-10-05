@@ -19,7 +19,8 @@ APP_PORT="${WP_APP_PORT:-8200}"
 SERVICE_NAME="${WP_SERVICE_NAME:-photo-upload}"
 LETSENCRYPT_EMAIL="${WP_LETSENCRYPT_EMAIL:-}"
 ENABLE_HTTPS="${WP_ENABLE_HTTPS:-ask}"
-MAX_FILE_SIZE_MB="${WP_MAX_FILE_SIZE_MB:-15}"
+MAX_FILE_SIZE_MB="${WP_MAX_FILE_SIZE_MB:-40}"
+MAX_VIDEO_SIZE_MB="${WP_MAX_VIDEO_SIZE_MB:-500}"
 MAX_FILES_PER_REQUEST="${WP_MAX_FILES_PER_REQUEST:-10}"
 RATE_LIMIT_PER_MINUTE="${WP_RATE_LIMIT_PER_MINUTE:-20}"
 YANDEX_ACCESS_KEY_ID="${WP_YANDEX_ACCESS_KEY_ID:-}"
@@ -53,7 +54,8 @@ Non-interactive variables (examples):
   WP_LETSENCRYPT_EMAIL=admin@example.com
   WP_ENABLE_HTTPS=yes|no
   WP_APP_PORT=8200
-  WP_MAX_FILE_SIZE_MB=15
+  WP_MAX_FILE_SIZE_MB=40
+  WP_MAX_VIDEO_SIZE_MB=500
   WP_YANDEX_ACCESS_KEY_ID=...
   WP_YANDEX_SECRET_ACCESS_KEY=...
   WP_S3_BUCKET=...
@@ -177,7 +179,7 @@ install_packages() {
     apt)
       run apt-get update -y
       run DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        python3 python3-venv python3-pip nginx curl ca-certificates
+        python3 python3-venv python3-pip nginx curl ca-certificates ffmpeg
       if [[ "${ENABLE_HTTPS}" == "yes" ]]; then
         run DEBIAN_FRONTEND=noninteractive apt-get install -y certbot
       fi
@@ -263,6 +265,7 @@ ${yandex_block}
 SITE_DOMAIN=${SITE_DOMAIN}
 CORS_ORIGINS=${cors}
 MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB}
+MAX_VIDEO_SIZE_MB=${MAX_VIDEO_SIZE_MB}
 MAX_FILES_PER_REQUEST=${MAX_FILES_PER_REQUEST}
 RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE}
 BASE_PATH=${BASE_PATH}
@@ -414,7 +417,9 @@ enable_nginx_site() {
 write_nginx_config() {
   local conf
   conf="$(nginx_conf_path)"
-  local body_mb=$((MAX_FILE_SIZE_MB + 5))
+  # Body limit must fit the largest allowed upload (videos are much bigger).
+  local biggest=$(( MAX_FILE_SIZE_MB > MAX_VIDEO_SIZE_MB ? MAX_FILE_SIZE_MB : MAX_VIDEO_SIZE_MB ))
+  local body_mb=$((biggest + 5))
   local body="${body_mb}m"
   local tmp
   tmp="$(mktemp)"
@@ -562,7 +567,8 @@ collect_answers() {
     [[ -n "${S3_BUCKET}" ]] || die "Нужен S3_BUCKET"
   fi
 
-  prompt MAX_FILE_SIZE_MB "Лимит размера файла, МБ" "${MAX_FILE_SIZE_MB}"
+  prompt MAX_FILE_SIZE_MB "Лимит фото, МБ" "${MAX_FILE_SIZE_MB}"
+  prompt MAX_VIDEO_SIZE_MB "Лимит видео, МБ" "${MAX_VIDEO_SIZE_MB}"
   prompt MAX_FILES_PER_REQUEST "Файлов за один заход" "${MAX_FILES_PER_REQUEST}"
   prompt RATE_LIMIT_PER_MINUTE "Rate limit / IP в минуту" "${RATE_LIMIT_PER_MINUTE}"
   prompt APP_PORT "Локальный порт uvicorn" "${APP_PORT}"

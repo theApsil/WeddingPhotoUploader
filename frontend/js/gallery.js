@@ -17,8 +17,10 @@ const state = {
   offset: 0,
   total: 0,
   kind: "all",
+  guest: "",
   loading: false,
   current: -1,
+  hasMore: false,
 };
 
 function setStatus(message, cls = "loading") {
@@ -42,6 +44,15 @@ function makeTile(item, index) {
   tile.title = `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}`;
 
   if (item.kind === "video") {
+    if (item.poster_url) {
+      const img = document.createElement("img");
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = "Видео";
+      img.src = item.poster_url;
+      img.onerror = () => img.remove(); // keep the play icon if no poster frame
+      tile.appendChild(img);
+    }
     const play = document.createElement("span");
     play.className = "tile-play";
     play.textContent = "▶";
@@ -51,7 +62,18 @@ function makeTile(item, index) {
     img.loading = "lazy";
     img.decoding = "async";
     img.alt = "Фото со свадьбы";
-    img.src = item.thumb_url || item.url;
+    // Fall back to display/original if a preview is missing (e.g. old data).
+    const fallbacks = [item.thumb_url, item.display_url, item.url].filter(Boolean);
+    img.src = fallbacks[0] || "";
+    let fi = 1;
+    img.onerror = () => {
+      if (fi < fallbacks.length) {
+        img.src = fallbacks[fi++];
+      } else {
+        tile.classList.add("tile-broken");
+        img.remove();
+      }
+    };
     tile.appendChild(img);
   }
 
@@ -67,6 +89,10 @@ function makeTile(item, index) {
 function renderTotal() {
   const label = state.kind === "all" ? "Всего" : state.kind === "video" ? "Видео" : "Фото";
   els.total.textContent = `${label} · ${state.total}`;
+}
+
+function guestQuery() {
+  return state.guest ? `&guest=${encodeURIComponent(state.guest)}` : "";
 }
 
 function renderLoadMore() {
@@ -89,8 +115,17 @@ function render() {
   renderLoadMore();
 }
 
+// In-flight list request; a new filter aborts it so the latest click wins.
+let inflight = null;
+
 async function load(reset = false) {
-  if (state.loading) return;
+  if (reset) {
+    inflight?.abort();
+  } else if (state.loading) {
+    return; // "Показать ещё" while a page is already coming
+  }
+  const controller = new AbortController();
+  inflight = controller;
   if (reset) {
     state.offset = 0;
     state.items = [];
@@ -102,22 +137,25 @@ async function load(reset = false) {
 
   try {
     const data = await api(
-      `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}`,
+      `/api/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}${guestQuery()}`,
+      { signal: controller.signal },
     );
+    if (controller !== inflight) return; // superseded by a newer filter
     state.total = data.total;
+    state.hasMore = data.has_more;
     state.items = reset ? data.items : state.items.concat(data.items);
     state.offset = state.items.length;
 
     if (!state.items.length) {
       setStatus("Пока пусто — загрузите фото или видео на странице «Загрузить».", "empty");
-      renderTotal();
-      renderLoadMore();
+      render(); // also clears tiles left over from the previous filter
       return;
     }
 
     setStatus("");
     render();
   } catch (err) {
+    if (controller !== inflight || err.name === "AbortError") return;
     setStatus("", "error-box");
     showAlert(
       els.alert,
@@ -126,7 +164,11 @@ async function load(reset = false) {
     );
     renderLoadMore();
   } finally {
-    state.loading = false;
+    if (controller === inflight) {
+      state.loading = false;
+      inflight = null;
+      renderLoadMore();
+    }
   }
 }
 
@@ -153,11 +195,25 @@ function renderStage() {
     video.src = item.url;
     els.lbStage.appendChild(video);
   } else {
+    // Show the EXIF-free display JPEG (works for HEIC everywhere, lighter);
+    // fall back to the original when no display version exists.
     const img = document.createElement("img");
-    img.src = item.url;
+    img.src = item.display_url || item.url;
     img.alt = "Фото со свадьбы";
+    if (item.display_url && item.url) {
+      // Old uploads may have no display JPEG yet — show the original instead.
+      img.addEventListener("error", () => { img.src = item.url; }, { once: true });
+    }
     els.lbStage.appendChild(img);
   }
+  const download = document.createElement("a");
+  download.className = "lb-download";
+  download.href = item.url;
+  download.download = "";
+  download.textContent = "Скачать";
+  download.target = "_blank";
+  download.rel = "noopener noreferrer";
+  els.lbStage.appendChild(download);
   els.lbMeta.textContent =
     `${state.current + 1} / ${state.items.length} · ` +
     `${formatWhen(item.uploaded_at)} · ${formatBytes(item.size_bytes)}`;
@@ -180,21 +236,62 @@ function closeLightbox() {
   state.current = -1;
 }
 
-function step(delta) {
+async function step(delta) {
   if (state.current < 0 || !state.items.length) return;
-  state.current = (state.current + delta + state.items.length) % state.items.length;
+  let next = state.current + delta;
+  if (delta > 0 && next >= state.items.length) {
+    // Load the next page so the lightbox can keep navigating forward.
+    if (state.hasMore && !state.loading) {
+      await load(false);
+    }
+    next = Math.min(next, state.items.length - 1);
+  } else if (delta < 0 && next < 0) {
+    next = state.items.length - 1;
+  }
+  state.current = next;
   renderStage();
 }
 
 function bindFilters() {
   document.querySelectorAll(".filter-btn").forEach((btn) => {
     btn.addEventListener("click", () => {
+      // A newer filter aborts the in-flight request inside load(true).
       document.querySelectorAll(".filter-btn").forEach((b) => b.classList.remove("is-active"));
       btn.classList.add("is-active");
       state.kind = btn.dataset.kind;
       load(true);
     });
   });
+
+  const guestSel = document.getElementById("guest-filter");
+  if (guestSel) {
+    guestSel.addEventListener("change", () => {
+      state.guest = guestSel.value;
+      load(true);
+    });
+  }
+}
+
+async function loadGuests() {
+  const guestSel = document.getElementById("guest-filter");
+  if (!guestSel) return;
+  try {
+    const data = await api("/api/photos/guests");
+    const options = data.guests || [];
+    guestSel.innerHTML = "";
+    const all = document.createElement("option");
+    all.value = "";
+    all.textContent = "Все";
+    guestSel.appendChild(all);
+    options.forEach((name) => {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      guestSel.appendChild(opt);
+    });
+  } catch {
+    // Non-fatal: the gallery works without the name filter.
+  }
 }
 
 function bindLightbox() {
@@ -216,4 +313,5 @@ function bindLightbox() {
 applySiteCopy();
 bindFilters();
 bindLightbox();
+loadGuests();
 load(true);

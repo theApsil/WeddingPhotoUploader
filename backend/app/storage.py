@@ -10,7 +10,16 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from app.config import CONTENT_TYPE_EXTENSION, Settings, is_image, is_video
-from app.thumbnails import THUMB_PREFIX, generate_thumbnail, thumb_key_for
+from app.thumbnails import (
+    DISPLAY_PREFIX,
+    POSTER_PREFIX,
+    THUMB_PREFIX,
+    display_key_for,
+    generate_display,
+    generate_thumbnail,
+    poster_key_for,
+    thumb_key_for,
+)
 
 logger = logging.getLogger("wedding.storage")
 
@@ -57,7 +66,8 @@ class LocalStorage:
     def absolute_path(self, key: str) -> Path:
         """Resolve key under root; reject traversal outside STORAGE_DIR."""
         prefix = key.split("/", 1)[0] if "/" in key else key
-        if prefix not in ("uploads", THUMB_PREFIX) or ".." in key or key.count("/") < 2:
+        allowed = ("uploads", THUMB_PREFIX, DISPLAY_PREFIX, POSTER_PREFIX)
+        if prefix not in allowed or ".." in key or key.count("/") < 2:
             raise ValueError("недопустимый ключ объекта")
         path = (self.root / key).resolve()
         try:
@@ -103,6 +113,19 @@ class LocalStorage:
             return None
         return self.save_bytes(self.thumb_key(key), thumb)
 
+    def display_key(self, key: str) -> str:
+        return display_key_for(key)
+
+    def save_display(self, key: str, data: bytes) -> Path | None:
+        """Generate and persist a display-size (EXIF-free) JPEG for an image key."""
+        if not is_image(self._content_type(key)):
+            return None
+        display = generate_display(data, size=self.settings.display_size)
+        if not display:
+            logger.warning("Display-версия не создана для %s", key)
+            return None
+        return self.save_bytes(self.display_key(key), display)
+
     def _content_type(self, key: str) -> str:
         ext = key.rsplit(".", 1)[-1].lower()
         for ct, cext in CONTENT_TYPE_EXTENSION.items():
@@ -116,6 +139,19 @@ class LocalStorage:
 
     def thumb_url(self, key: str, base_path: str = "") -> str:
         return self.photo_url(self.thumb_key(key), base_path)
+
+    def display_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.display_key(key), base_path)
+
+    def poster_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.poster_key(key), base_path)
+
+    def poster_key(self, key: str) -> str:
+        return poster_key_for(key)
+
+    def save_poster(self, key: str, data: bytes) -> Path | None:
+        """Persist a pre-extracted poster JPEG for a video key."""
+        return self.save_bytes(self.poster_key(key), data)
 
     # Back-compat alias used by older call sites.
     def file_url(self, key: str, base_path: str = "") -> str:
@@ -217,6 +253,20 @@ class YandexStorage:
                 logger.exception("Не удалось проверить объект %s в бакете", key)
             return False
 
+    def stat(self, key: str) -> int | None:
+        """Server-reported object size in bytes (head_object), or None on failure."""
+        if self.settings.s3_mock:
+            return None
+        client = self._get_client()
+        try:
+            resp = client.head_object(Bucket=self.settings.s3_bucket, Key=key)
+            return int(resp.get("ContentLength", 0))
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+            if code not in _NOT_FOUND_CODES:
+                logger.exception("Не удалось получить размер %s из бакета", key)
+            return None
+
     def photo_url(self, key: str, base_path: str = "") -> str:
         settings = self.settings
         if settings.public_read:
@@ -292,6 +342,32 @@ class YandexStorage:
             logger.warning("Превью не создано для %s", key)
             return False
         return self.put_bytes(self.thumb_key(key), thumb)
+
+    def display_key(self, key: str) -> str:
+        return display_key_for(key)
+
+    def display_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.display_key(key), base_path)
+
+    def save_display(self, key: str, data: bytes) -> bool:
+        """Generate and store a display-size (EXIF-free) JPEG for an image object."""
+        if not is_image(self._content_type(key)):
+            return False
+        display = generate_display(data, size=self.settings.display_size)
+        if not display:
+            logger.warning("Display-версия не создана для %s", key)
+            return False
+        return self.put_bytes(self.display_key(key), display)
+
+    def poster_key(self, key: str) -> str:
+        return poster_key_for(key)
+
+    def poster_url(self, key: str, base_path: str = "") -> str:
+        return self.photo_url(self.poster_key(key), base_path)
+
+    def save_poster(self, key: str, data: bytes) -> bool:
+        """Persist a pre-extracted poster JPEG for a video object."""
+        return self.put_bytes(self.poster_key(key), data)
 
     def delete(self, key: str) -> bool:
         if self.settings.s3_mock:

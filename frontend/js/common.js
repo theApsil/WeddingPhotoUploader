@@ -17,8 +17,8 @@ export const VIDEO_TYPES = new Set([
 
 export const ALLOWED_TYPES = new Set([...IMAGE_TYPES, ...VIDEO_TYPES]);
 
-export const MAX_SIZE_MB_DEFAULT = 15;
-export const MAX_VIDEO_SIZE_MB_DEFAULT = 200;
+export const MAX_SIZE_MB_DEFAULT = 40;
+export const MAX_VIDEO_SIZE_MB_DEFAULT = 500;
 // 0 = no per-request file count limit.
 export const MAX_FILES_DEFAULT = 0;
 
@@ -114,4 +114,35 @@ export function applySiteCopy() {
   document.querySelectorAll("[data-site-names]").forEach((node) => {
     node.textContent = names;
   });
+}
+
+/* ---- Guest identity (remembered name) ---- */
+
+export const GUEST_NAME_COOKIE = "guest_name";
+export const HOME_URL = "index.html";
+export const UPLOAD_URL = "upload.html";
+
+function _cookieEscape(name) {
+  return name.replace(/([.*+?^${}()|[\]\\])/g, "\\$1");
+}
+
+export function getCookie(name) {
+  const m = document.cookie.match(
+    new RegExp("(?:^|; )" + _cookieEscape(name) + "=([^;]*)"),
+  );
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+/** Remember the guest name for a year so returning guests skip the form. */
+export function setGuestName(name) {
+  document.cookie =
+    `${GUEST_NAME_COOKIE}=${encodeURIComponent(name)}; path=/; max-age=${60 * 60 * 24 * 365}; samesite=lax`;
+}
+
+export function clearGuestName() {
+  document.cookie = `${GUEST_NAME_COOKIE}=; path=/; max-age=0; samesite=lax`;
+}
+
+export function guestName() {
+  return getCookie(GUEST_NAME_COOKIE).trim();
 }

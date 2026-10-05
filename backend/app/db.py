@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import aiosqlite
+
+_PERCENT_ESCAPE = re.compile(r"%[0-9A-Fa-f]{2}")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS photos (
@@ -16,9 +20,23 @@ CREATE TABLE IF NOT EXISTS photos (
     size_bytes INTEGER NOT NULL,
     uploaded_at TEXT NOT NULL,
     client_ip TEXT NOT NULL DEFAULT '',
-    hidden INTEGER NOT NULL DEFAULT 0
+    guest_name TEXT NOT NULL DEFAULT '',
+    hidden INTEGER NOT NULL DEFAULT 0,
+    pending INTEGER NOT NULL DEFAULT 0,
+    thumb_width INTEGER,
+    thumb_height INTEGER,
+    display_width INTEGER,
+    display_height INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_photos_uploaded_at ON photos(uploaded_at DESC, id DESC);
+
+-- Keys the app handed out (presign) or started writing (local upload) that are
+-- not in photos yet. Orphan cleanup deletes only these — never "anything in
+-- storage without a row" — so a lost or restored DB can't wipe real photos.
+CREATE TABLE IF NOT EXISTS unconfirmed_uploads (
+    object_key TEXT PRIMARY KEY,
+    issued_at TEXT NOT NULL
+);
 """
 
 
@@ -37,10 +55,37 @@ class PhotoRepository:
         """Add columns introduced after the original schema (idempotent)."""
         cursor = await db.execute("PRAGMA table_info(photos)")
         existing = {row[1] for row in await cursor.fetchall()}
-        if "hidden" not in existing:
-            await db.execute(
-                "ALTER TABLE photos ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"
-            )
+        additions = {
+            "hidden": "INTEGER NOT NULL DEFAULT 0",
+            "guest_name": "TEXT NOT NULL DEFAULT ''",
+            "pending": "INTEGER NOT NULL DEFAULT 0",
+            "thumb_width": "INTEGER",
+            "thumb_height": "INTEGER",
+            "display_width": "INTEGER",
+            "display_height": "INTEGER",
+        }
+        for name, decl in additions.items():
+            if name not in existing:
+                await db.execute(f"ALTER TABLE photos ADD COLUMN {name} {decl}")
+        await self._decode_guest_names(db)
+
+    async def _decode_guest_names(self, db: aiosqlite.Connection) -> None:
+        """Fix names stored percent-encoded (%D0%9F...) before the cookie was decoded."""
+        cursor = await db.execute(
+            "SELECT DISTINCT guest_name FROM photos WHERE guest_name LIKE '%!%%' ESCAPE '!'"
+        )
+        for (name,) in await cursor.fetchall():
+            if not _PERCENT_ESCAPE.search(name):
+                continue
+            try:
+                decoded = unquote(name, errors="strict")
+            except UnicodeDecodeError:
+                continue  # not our encoding — leave the name as is
+            if decoded != name:
+                await db.execute(
+                    "UPDATE photos SET guest_name = ? WHERE guest_name = ?",
+                    (decoded, name),
+                )
 
     async def add(
         self,
@@ -50,16 +95,36 @@ class PhotoRepository:
         size_bytes: int,
         uploaded_at: str,
         client_ip: str,
+        guest_name: str = "",
+        pending: bool = False,
+        thumb_width: int | None = None,
+        thumb_height: int | None = None,
+        display_width: int | None = None,
+        display_height: int | None = None,
     ) -> dict[str, Any]:
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
             await db.execute(
                 """
                 INSERT OR IGNORE INTO photos
-                    (object_key, content_type, size_bytes, uploaded_at, client_ip)
-                VALUES (?, ?, ?, ?, ?)
+                    (object_key, content_type, size_bytes, uploaded_at, client_ip,
+                     guest_name, pending, thumb_width, thumb_height,
+                     display_width, display_height)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (object_key, content_type, size_bytes, uploaded_at, client_ip),
+                (
+                    object_key,
+                    content_type,
+                    size_bytes,
+                    uploaded_at,
+                    client_ip,
+                    guest_name,
+                    1 if pending else 0,
+                    thumb_width,
+                    thumb_height,
+                    display_width,
+                    display_height,
+                ),
             )
             await db.commit()
             cursor = await db.execute(
@@ -68,6 +133,27 @@ class PhotoRepository:
             )
             row = await cursor.fetchone()
             return dict(row) if row else {}
+
+    async def update_dimensions(
+        self,
+        photo_id: int,
+        *,
+        thumb_width: int | None,
+        thumb_height: int | None,
+        display_width: int | None,
+        display_height: int | None,
+    ) -> None:
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                """
+                UPDATE photos
+                SET thumb_width = ?, thumb_height = ?,
+                    display_width = ?, display_height = ?
+                WHERE id = ?
+                """,
+                (thumb_width, thumb_height, display_width, display_height, photo_id),
+            )
+            await db.commit()
 
     async def get_by_key(self, object_key: str) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.database_path) as db:
@@ -92,17 +178,25 @@ class PhotoRepository:
     def _filters(
         self,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> tuple[list[str], list[Any]]:
         where: list[str] = []
         params: list[Any] = []
         if hidden is not None:
             where.append("hidden = ?")
             params.append(1 if hidden else 0)
+        if pending is not None:
+            where.append("pending = ?")
+            params.append(1 if pending else 0)
         if kind == "image":
             where.append("content_type LIKE 'image/%'")
         elif kind == "video":
             where.append("content_type LIKE 'video/%'")
+        if guest:
+            where.append("guest_name = ?")
+            params.append(guest)
         return where, params
 
     async def list_recent(
@@ -110,17 +204,22 @@ class PhotoRepository:
         limit: int = 100,
         offset: int = 0,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> list[dict[str, Any]]:
-        where, params = self._filters(hidden=hidden, kind=kind)
+        where, params = self._filters(
+            hidden=hidden, pending=pending, kind=kind, guest=guest
+        )
         sql = """
             SELECT id, object_key, content_type, size_bytes, uploaded_at,
-                   client_ip, hidden
+                   client_ip, guest_name, hidden, pending, thumb_width,
+                   thumb_height, display_width, display_height
             FROM photos
         """
         if where:
             sql += " WHERE " + " AND ".join(where)
-        sql += " ORDER BY uploaded_at DESC LIMIT ? OFFSET ?"
+        sql += " ORDER BY uploaded_at DESC, id DESC LIMIT ? OFFSET ?"
         params += [limit, offset]
         async with aiosqlite.connect(self.database_path) as db:
             db.row_factory = aiosqlite.Row
@@ -131,9 +230,13 @@ class PhotoRepository:
     async def count(
         self,
         hidden: bool | None = None,
+        pending: bool | None = None,
         kind: str = "all",
+        guest: str | None = None,
     ) -> int:
-        where, params = self._filters(hidden=hidden, kind=kind)
+        where, params = self._filters(
+            hidden=hidden, pending=pending, kind=kind, guest=guest
+        )
         sql = "SELECT COUNT(*) AS c FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -142,9 +245,14 @@ class PhotoRepository:
             row = await cursor.fetchone()
             return int(row[0]) if row else 0
 
-    async def list_all(self, kind: str = "all") -> list[dict[str, Any]]:
-        """All rows (no pagination) — used for one-time thumbnail backfill."""
-        where, params = self._filters(kind=kind)
+    async def list_all(
+        self,
+        kind: str = "all",
+        hidden: bool | None = None,
+        pending: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """All rows (no pagination) — used for backfill / maintenance."""
+        where, params = self._filters(kind=kind, hidden=hidden, pending=pending)
         sql = "SELECT id, object_key, content_type FROM photos"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -153,6 +261,34 @@ class PhotoRepository:
             cursor = await db.execute(sql, params)
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    async def list_guests(self, *, approved_only: bool = False) -> list[str]:
+        """Distinct non-empty guest names, most recent first — for the filter UI."""
+        where = ["guest_name != ''"]
+        params: list[Any] = []
+        if approved_only:
+            where.append("hidden = 0 AND pending = 0")
+        sql = (
+            "SELECT guest_name FROM photos"
+            " WHERE "
+            + " AND ".join(where)
+            + " GROUP BY guest_name"
+            " ORDER BY MAX(uploaded_at) DESC, guest_name COLLATE NOCASE"
+        )
+        async with aiosqlite.connect(self.database_path) as db:
+            cursor = await db.execute(sql, params)
+            rows = await cursor.fetchall()
+            return [r[0] for r in rows]
+
+    async def set_pending(self, photo_id: int, pending: bool) -> dict[str, Any] | None:
+        """Approve (pending=False) or reject (pending=True) a moderated upload."""
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.execute(
+                "UPDATE photos SET pending = ? WHERE id = ?",
+                (1 if pending else 0, photo_id),
+            )
+            await db.commit()
+        return await self.get_by_id(photo_id)
 
     async def set_hidden(self, photo_id: int, hidden: bool) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.database_path) as db:
@@ -171,6 +307,44 @@ class PhotoRepository:
             await db.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
             await db.commit()
         return row
+
+
+    async def track_unconfirmed(self, keys: list[str], issued_at: str) -> None:
+        """Remember keys handed out for upload until they are confirmed."""
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "INSERT OR IGNORE INTO unconfirmed_uploads (object_key, issued_at) VALUES (?, ?)",
+                [(key, issued_at) for key in keys],
+            )
+            await db.commit()
+
+    async def untrack_unconfirmed(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        async with aiosqlite.connect(self.database_path) as db:
+            await db.executemany(
+                "DELETE FROM unconfirmed_uploads WHERE object_key = ?",
+                [(key,) for key in keys],
+            )
+            await db.commit()
+
+    async def stale_unconfirmed(self, issued_before: str, limit: int) -> list[str]:
+        """Tracked keys issued before the cutoff that never became a photo (oldest first)."""
+        async with aiosqlite.connect(self.database_path) as db:
+            # Confirmed but not untracked (e.g. crash in between) — just forget them.
+            await db.execute(
+                "DELETE FROM unconfirmed_uploads"
+                " WHERE object_key IN (SELECT object_key FROM photos)"
+            )
+            await db.commit()
+            cursor = await db.execute(
+                "SELECT object_key FROM unconfirmed_uploads"
+                " WHERE issued_at < ? ORDER BY issued_at LIMIT ?",
+                (issued_before, limit),
+            )
+            return [row[0] for row in await cursor.fetchall()]
 
 
 def resolve_db_path(path: str) -> str:

@@ -128,3 +128,98 @@ def test_admin_delete_removes_file_and_db(admin_client, env_local):
 def test_admin_delete_requires_auth(admin_client):
     res = admin_client.delete("/api/admin/photos/1")
     assert res.status_code == 401
+
+
+def test_hidden_original_not_served_by_direct_link(admin_client):
+    """Hiding must remove direct-link access to the local original."""
+    saved = _upload(admin_client)
+    url = saved["url"]
+    assert admin_client.get(url).status_code == 200
+
+    listing = admin_client.get("/api/admin/photos", headers=_auth()).json()
+    photo_id = listing["items"][0]["id"]
+    admin_client.patch(
+        f"/api/admin/photos/{photo_id}", json={"hidden": True}, headers=_auth()
+    )
+
+    # Original is now withheld; the derived (EXIF-free) display still works.
+    assert admin_client.get(url).status_code == 404
+    assert admin_client.get(saved["display_url"]).status_code == 200
+
+
+def test_trusted_proxy_ignores_spoofed_leftmost_ip(admin_client):
+    """X-Forwarded-For spoofing must not override the real (rightmost) IP."""
+    _upload(admin_client, headers={"X-Forwarded-For": "1.2.3.4, 9.9.9.9"})
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["client_ip"] == "9.9.9.9"
+
+
+def test_guest_name_attributed_from_cookie(admin_client):
+    admin_client.cookies.set("guest_name", "Ivan Ivanov")
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == "Ivan Ivanov"
+
+
+def test_no_guest_name_when_cookie_absent(admin_client):
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == ""
+
+
+def test_admin_brute_force_rate_limited(admin_client):
+    """Repeated wrong passwords should eventually hit 429."""
+    bad = {"Authorization": "Bearer wrong"}
+    statuses = {admin_client.get("/api/admin/photos", headers=bad).status_code for _ in range(15)}
+    assert 401 in statuses
+    assert 429 in statuses
+
+def test_cyrillic_guest_name_cookie_is_decoded(admin_client):
+    """The frontend writes the cookie with encodeURIComponent."""
+    from urllib.parse import quote
+
+    admin_client.cookies.set("guest_name", quote("Пупуня"))
+    _upload(admin_client)
+    item = admin_client.get("/api/admin/photos", headers=_auth()).json()["items"][0]
+    assert item["guest_name"] == "Пупуня"
+    guests = admin_client.get("/api/photos/guests").json()["guests"]
+    assert guests == ["Пупуня"]
+
+
+async def test_percent_encoded_names_fixed_on_startup(tmp_path):
+    """Rows saved before the fix get their names decoded by the migration."""
+    import aiosqlite
+
+    from app.db import PhotoRepository
+
+    repo = PhotoRepository(str(tmp_path / "photos.db"))
+    await repo.init()
+    for i, name in enumerate(["%D0%9F%D1%83%D0%BF%D1%83%D0%BD%D1%8F", "100%", "Ivan"]):
+        await repo.add(
+            object_key=f"uploads/2026-10-05/{i}.jpg",
+            content_type="image/jpeg",
+            size_bytes=1,
+            uploaded_at="2026-10-05T00:00:00+00:00",
+            client_ip="",
+            guest_name=name,
+        )
+    await repo.init()  # restart runs the migration again
+    async with aiosqlite.connect(repo.database_path) as db:
+        rows = await (await db.execute("SELECT guest_name FROM photos ORDER BY id")).fetchall()
+    assert [r[0] for r in rows] == ["Пупуня", "100%", "Ivan"]
+
+
+def test_admin_successful_requests_not_rate_limited(admin_client):
+    """Moderation makes many requests a minute — only failures may count."""
+    statuses = {
+        admin_client.get("/api/admin/photos", headers=_auth()).status_code for _ in range(25)
+    }
+    assert statuses == {200}
+
+
+def test_blocked_ip_gets_429_even_with_correct_password(admin_client):
+    """Once blocked, a right guess must not be distinguishable from a wrong one."""
+    bad = {"Authorization": "Bearer wrong"}
+    for _ in range(15):
+        admin_client.get("/api/admin/photos", headers=bad)
+    assert admin_client.get("/api/admin/photos", headers=_auth()).status_code == 429

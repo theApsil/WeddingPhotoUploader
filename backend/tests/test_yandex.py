@@ -20,7 +20,7 @@ def test_health_reports_yandex(client_yandex):
     assert data["storage_backend"] == "yandex"
     assert data["storage_configured"] is True
     assert data["s3_bucket"] == "wedding-photos-test"
-    assert data["storage_dir"] is None
+    assert "storage_dir" not in data
 
 
 def test_yandex_rejects_multipart_upload(client_yandex):

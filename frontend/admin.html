@@ -26,7 +26,8 @@
     </header>
 
     <nav class="nav" aria-label="Разделы">
-      <a class="nav-link" href="index.html">Загрузить</a>
+      <a class="nav-link" href="index.html">Главная</a>
+      <a class="nav-link" href="upload.html">Загрузить</a>
       <a class="nav-link" href="gallery.html">Галерея</a>
       <a class="nav-link is-active" href="admin.html">Админ</a>
     </nav>
@@ -49,10 +50,7 @@
       <div class="gallery-head">
         <div id="admin-total" class="hints">Всего · …</div>
         <div class="admin-tools">
-          <label class="check">
-            <input type="checkbox" id="show-hidden">
-            <span>Скрытые</span>
-          </label>
+          <button type="button" id="archive-btn" class="btn btn-small">Скачать архив</button>
           <button type="button" id="logout-btn" class="btn btn-ghost btn-small">Выйти</button>
         </div>
       </div>
@@ -61,6 +59,20 @@
         <button type="button" class="filter-btn is-active" data-kind="all">Все</button>
         <button type="button" class="filter-btn" data-kind="image">Фото</button>
         <button type="button" class="filter-btn" data-kind="video">Видео</button>
+      </div>
+
+      <div class="gallery-sub">
+        <label class="check">
+          <input type="checkbox" id="show-hidden">
+          <span>Скрытые</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="pending-only">
+          <span>На модерации</span>
+        </label>
+        <select id="admin-guest-filter" class="guest-select" aria-label="Фильтр по гостю">
+          <option value="">Все гости</option>
+        </select>
       </div>
 
       <div id="admin-alert" class="alert alert-error" hidden></div>

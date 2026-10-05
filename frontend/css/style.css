@@ -555,6 +555,25 @@ a {
   background: linear-gradient(180deg, rgba(11, 20, 16, 0.12), rgba(11, 20, 16, 0.5));
 }
 
+.tile-broken {
+  background: rgba(29, 59, 42, 0.5);
+}
+
+.lb-download {
+  position: absolute;
+  bottom: calc(3.2rem + var(--safe-b));
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--gold-light);
+  font-size: 0.85rem;
+  background: rgba(11, 20, 16, 0.72);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.9rem;
+  border-radius: 999px;
+  text-decoration: none;
+  z-index: 1;
+}
+
 .filters {
   display: flex;
   gap: 0.4rem;
@@ -584,6 +603,37 @@ a {
 .load-more {
   width: 100%;
   margin-top: 1rem;
+}
+
+.gallery-sub {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.guest-label {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.guest-select {
+  flex: 1;
+  min-width: 0;
+  background: rgba(11, 20, 16, 0.5);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--gold-light);
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.4rem 0.8rem;
+  min-height: 36px;
+}
+
+.guest-select:focus {
+  outline: none;
+  border-color: var(--gold);
 }
 
 .empty,
@@ -842,4 +892,68 @@ body.no-scroll {
   .card {
     padding: 1.35rem 1.25rem 1.45rem;
   }
+}
+
+/* ---- Welcome / guest name ---- */
+
+.welcome-card {
+  text-align: center;
+}
+
+.welcome-ornament {
+  margin: 0 0 0.4rem;
+  color: var(--gold);
+  letter-spacing: 0.5em;
+  font-size: 0.9rem;
+}
+
+.welcome-title {
+  margin: 0 0 0.6rem;
+  font-family: "Cormorant Garamond", serif;
+  font-weight: 500;
+  font-size: 1.5rem;
+  color: var(--gold-light);
+}
+
+.welcome-lead {
+  margin-bottom: 1.1rem;
+  line-height: 1.55;
+}
+
+.welcome-card .field {
+  text-align: left;
+  margin-bottom: 0.2rem;
+}
+
+.welcome-note {
+  margin: 0.9rem 0 0;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  font-weight: 300;
+}
+
+/* ---- Guest banner (upload page) ---- */
+
+.guest-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.9rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(11, 20, 16, 0.4);
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+
+.guest-banner strong {
+  color: var(--gold-light);
+  font-weight: 500;
+}
+
+.guest-banner a {
+  margin-left: auto;
+  font-size: 0.8rem;
 }

@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0b1410">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <!-- Optional: <meta name="base-path" content="/wedding"> for non-default prefix -->
-  <title>Данил и Полина — загрузка фото</title>
+  <title>Данил и Полина — добро пожаловать</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -23,71 +23,44 @@
         <span data-site="bride">Полина</span>
       </h1>
       <p class="date" data-site="dateShort">17 · 10 · 2026</p>
-      <p class="tagline" data-site="tagline">Поделитесь своими снимками с нашего дня</p>
     </header>
 
     <nav class="nav" aria-label="Разделы">
-      <a class="nav-link is-active" href="index.html">Загрузить</a>
+      <a class="nav-link is-active" href="index.html">Главная</a>
       <a class="nav-link" href="gallery.html">Галерея</a>
     </nav>
 
-    <section class="card">
-      <p class="lead">
-        Выберите фото или видео из галереи или снимите камерой.
-        Можно несколько файлов сразу — авторизация не нужна.
+    <section class="card welcome-card">
+      <p class="welcome-ornament" aria-hidden="true">✦ ✦ ✦</p>
+      <h2 class="welcome-title">Поделитесь с нами своим счастьем</h2>
+      <p class="lead welcome-lead">
+        Этот день мы ждали так долго, и он уже совсем скоро.
+        Мы будем бесконечно благодарны, если вы сохраните его
+        в наших сердцах — на фотографиях, которые пришлёте нам.
       </p>
 
-      <div class="pick-row">
-        <button type="button" id="pick-gallery" class="btn btn-pick">
-          Из галереи
-        </button>
-        <button type="button" id="pick-camera" class="btn btn-pick btn-outline">
-          Камера
-        </button>
-      </div>
+      <label class="field">
+        <span class="field-label">Как вас зовут?</span>
+        <input id="guest-name" class="input" type="text" autocomplete="name"
+               maxlength="80" placeholder="Например, Иван Иванов" autofocus>
+      </label>
 
-      <div id="dropzone" class="dropzone" role="button" tabindex="0"
-           aria-label="Выбрать файлы">
-        <span class="dz-ornament" aria-hidden="true">✦</span>
-        <strong>Нажмите или перетащите сюда</strong>
-        <span>JPEG, PNG, WebP, HEIC · MP4, WebM, MOV</span>
-      </div>
-      <input id="file-input" class="hidden-input" type="file"
-             accept="image/*,video/*" multiple>
-      <input id="camera-input" class="hidden-input" type="file"
-             accept="image/*,video/*" capture="environment">
+      <div id="welcome-alert" class="alert alert-error" hidden></div>
 
-      <div class="toolbar">
-        <div id="hints" class="hints"></div>
+      <div class="actions actions-single">
+        <button type="button" id="welcome-continue" class="btn">Продолжить</button>
       </div>
-
-      <div class="overall" id="overall" hidden>
-        <div class="overall-label">
-          <span>Общий прогресс</span>
-          <span id="overall-text">0%</span>
-        </div>
-        <div class="progress overall-bar"><i id="overall-bar"></i></div>
-      </div>
-
-      <div class="actions">
-        <button type="button" id="clear-btn" class="btn btn-ghost" disabled>
-          Очистить
-        </button>
-        <button type="button" id="upload-btn" class="btn" disabled>
-          Отправить фото
-        </button>
-      </div>
-
-      <div id="alert" class="alert alert-error" hidden></div>
-      <ul id="queue" class="queue"></ul>
+      <p class="welcome-note">
+        Имя сохранится в вашем браузере, чтобы в следующий раз не спрашивать его снова.
+      </p>
     </section>
 
     <p class="footer">
-      Без авторизации · <span data-site-names>Данил &amp; Полина</span>
+      <span data-site-names>Данил &amp; Полина</span>
       · <span data-site="dateLabel">17 октября 2026</span>
       · <a href="admin.html">Админ</a>
     </p>
   </div>
-  <script type="module" src="js/upload.js"></script>
+  <script type="module" src="js/home.js"></script>
 </body>
 </html>

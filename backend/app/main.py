@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, AsyncIterator, Union
+from urllib.parse import unquote
+from zipfile import ZIP_STORED, ZipFile
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,13 +34,17 @@ from app.config import (
 )
 from app.db import PhotoRepository, resolve_db_path
 from app.filetype import SNIFF_BYTES, content_matches
+from app.maintenance import maintenance_loop
+from app.poster import generate_poster_from_path, generate_poster_from_url
 from app.rate_limit import RateLimiter
+from app.thumbnails import image_dimensions, sanitize_original
 from app.schemas import (
     AdminListResponse,
     AdminPhotoOut,
     ConfirmRequest,
     ConfirmResponse,
     DeleteResponse,
+    GuestsResponse,
     HealthResponse,
     PhotoListResponse,
     PhotoPatchRequest,
@@ -44,7 +60,9 @@ Storage = Union[LocalStorage, YandexStorage]
 
 _repo: PhotoRepository | None = None
 _limiter: RateLimiter | None = None
+_admin_limiter: RateLimiter | None = None
 _storage: Storage | None = None
+_maintenance_task: asyncio.Task | None = None
 
 logger = logging.getLogger("wedding")
 # uvicorn configures only its own loggers; without a handler our INFO lines are
@@ -56,37 +74,68 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-async def _backfill_thumbnails(
-    repo: PhotoRepository,
-    storage: Storage,
-) -> None:
-    """One-time: generate missing thumbnails for existing local images."""
-    if not isinstance(storage, LocalStorage):
-        return
+async def _backfill_derived(repo: PhotoRepository, storage: Storage) -> None:
+    """Generate missing thumbnails + display JPEGs (and store dimensions).
+
+    Runs once at startup so pre-existing photos get derived images too.
+    Yandex downloads each missing image once (skipped in mock mode).
+    """
     try:
         rows = await repo.list_all(kind="image")
     except Exception:
-        logger.exception("Не удалось получить список фото для генерации превью")
+        logger.exception("Не удалось получить список фото для генерации производных изображений")
         return
-    created = 0
-    for row in rows:
+
+    def _process_one(row: dict[str, Any]) -> tuple[bool, tuple[int, int] | None]:
         key = row["object_key"]
         try:
-            if storage.exists(storage.thumb_key(key)):
-                continue
-            path = storage.absolute_path(key)
+            if storage.exists(storage.thumb_key(key)) and storage.exists(
+                storage.display_key(key)
+            ):
+                return False, None
         except ValueError:
-            continue
-        if not path.is_file():
-            continue
+            return False, None
+        raw = None
+        if isinstance(storage, LocalStorage):
+            try:
+                path = storage.absolute_path(key)
+            except ValueError:
+                return False, None
+            if not path.is_file():
+                return False, None
+            raw = path.read_bytes()
+        else:
+            if storage.settings.s3_mock:
+                return False, None
+            raw = storage.get_bytes(key)
+            if raw is None:
+                return False, None
+        if raw is None:
+            return False, None
+        storage.save_thumb(key, raw)
+        storage.save_display(key, raw)
+        return True, image_dimensions(raw)
+
+    updated = 0
+    for row in rows:
         try:
-            if storage.save_thumb(key, path.read_bytes()):
-                created += 1
+            done, dims = await asyncio.to_thread(_process_one, row)
+            if done:
+                updated += 1
+                if dims:
+                    w, h = dims
+                    await repo.update_dimensions(
+                        row["id"],
+                        thumb_width=w,
+                        thumb_height=h,
+                        display_width=w,
+                        display_height=h,
+                    )
         except Exception:
-            logger.exception("Не удалось сгенерировать превью для %s", key)
+            logger.exception("Не удалось обработать %s", row.get("object_key"))
             continue
-    if created:
-        logger.info("Сгенерировано превью для %s существующих фото", created)
+    if updated:
+        logger.info("Сгенерированы производные изображения для %s фото", updated)
 
 
 def _frontend_dir(settings: Settings) -> Path | None:
@@ -101,15 +150,27 @@ def _frontend_dir(settings: Settings) -> Path | None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    global _repo, _limiter, _storage
+    global _repo, _limiter, _admin_limiter, _storage, _maintenance_task
     settings = get_settings()
     _repo = PhotoRepository(resolve_db_path(settings.database_path))
     await _repo.init()
     _limiter = RateLimiter(settings.rate_limit_per_minute)
+    # Separate, tight fixed limiter for the admin panel (brute-force protection).
+    _admin_limiter = RateLimiter(limit_per_minute=10)
     _storage = create_storage(settings)
     _storage.ensure_ready()
-    await _backfill_thumbnails(_repo, _storage)
-    yield
+    await _backfill_derived(_repo, _storage)
+    _maintenance_task = asyncio.create_task(maintenance_loop(_repo, _storage, settings))
+    try:
+        yield
+    finally:
+        if _maintenance_task is not None:
+            _maintenance_task.cancel()
+            try:
+                await _maintenance_task
+            except asyncio.CancelledError:
+                pass
+            _maintenance_task = None
 
 
 def get_repo() -> PhotoRepository:
@@ -124,23 +185,52 @@ def get_limiter() -> RateLimiter:
     return _limiter
 
 
+def get_admin_limiter() -> RateLimiter:
+    if _admin_limiter is None:
+        raise RuntimeError("admin limiter not initialized")
+    return _admin_limiter
+
+
 def get_storage() -> Storage:
     if _storage is None:
         raise RuntimeError("storage not initialized")
     return _storage
 
 
-def client_ip(request: Request) -> str:
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
+def client_ip(request: Request, trusted_proxies: int = 1) -> str:
+    """Real client IP, taking X-Forwarded-For from the right.
+
+    Each trusted reverse proxy appends the peer IP it saw, so the rightmost
+    ``trusted_proxies`` entries are real hops; the entry just left of them is
+    the actual client. Leftmost entries are attacker-controlled and ignored.
+    """
+    if trusted_proxies > 0:
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            parts = [p.strip() for p in forwarded.split(",") if p.strip()]
+            idx = len(parts) - trusted_proxies
+            if idx >= 0:
+                candidate = parts[idx]
+                if candidate and candidate.lower() != "unknown":
+                    return candidate
     if request.client:
         return request.client.host
     return "unknown"
 
 
-def enforce_rate_limit(request: Request, limiter: RateLimiter) -> None:
-    allowed, _remaining = limiter.allow(client_ip(request))
+_GUEST_NAME_MAX = 80
+
+
+def _guest_name(request: Request) -> str:
+    """Read the remembered guest name from the cookie, sanitized and length-capped."""
+    # The frontend stores the name with encodeURIComponent (Cyrillic -> %D0%9F...).
+    raw = unquote((request.cookies.get("guest_name") or "").strip())
+    cleaned = "".join(ch for ch in raw if ch.isprintable() and ch not in "\r\n\t")
+    return cleaned[:_GUEST_NAME_MAX]
+
+
+def enforce_rate_limit(request: Request, limiter: RateLimiter, trusted_proxies: int) -> None:
+    allowed, _remaining = limiter.allow(client_ip(request, trusted_proxies))
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -176,37 +266,37 @@ def require_admin(
     request: Request,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> None:
-    """Reject admin calls unless the correct password is presented as a bearer token."""
+    """Reject admin calls unless the correct password is presented as a bearer token.
+
+    Only failed attempts count against the per-IP admin limiter, so normal
+    moderation (many requests a minute) is never throttled.
+    """
     password = settings.admin_password
     if not password:
         raise HTTPException(
             status_code=503,
             detail="Админка отключена. Задайте ADMIN_PASSWORD в .env.",
         )
+    limiter = get_admin_limiter()
+    ip = client_ip(request, settings.trusted_proxies)
+    # Checked before the password: once an IP is blocked even a correct guess
+    # gets 429, so the response can't confirm it.
+    if limiter.blocked(ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Слишком много попыток входа. Подождите минуту.",
+        )
     header = request.headers.get("Authorization", "")
     token = header[7:].strip() if header.lower().startswith("bearer ") else ""
     if not token or not hmac.compare_digest(token, password):
+        limiter.allow(ip)
         raise HTTPException(status_code=401, detail="Неверный пароль администратора.")
 
 
-def _thumb_size(storage: Storage, key: str) -> tuple[int | None, int | None]:
-    """Read thumbnail pixel size for a stable masonry layout (local only)."""
-    if not isinstance(storage, LocalStorage):
-        return None, None
-    try:
-        path = storage.absolute_path(storage.thumb_key(key))
-    except ValueError:
-        return None, None
-    if not path.is_file():
-        return None, None
-    try:
-        from PIL import Image
-
-        with Image.open(path) as im:
-            return im.size
-    except Exception:
-        logger.warning("Не удалось прочитать размер превью %s", path, exc_info=True)
-        return None, None
+def _thumb_url_for(row: dict[str, Any], storage: Storage, base: str) -> str | None:
+    if kind_of(row["content_type"]) == "image":
+        return storage.thumb_url(row["object_key"], base)
+    return None
 
 
 def _build_photo(
@@ -219,11 +309,6 @@ def _build_photo(
     key = row["object_key"]
     content_type = row["content_type"]
     kind = kind_of(content_type)
-    thumb_url = storage.thumb_url(key, base) if kind == "image" else None
-    thumb_width: int | None = None
-    thumb_height: int | None = None
-    if thumb_url is not None:
-        thumb_width, thumb_height = _thumb_size(storage, key)
     payload: dict[str, Any] = {
         "id": row["id"],
         "key": key,
@@ -232,13 +317,25 @@ def _build_photo(
         "size_bytes": row["size_bytes"],
         "uploaded_at": row["uploaded_at"],
         "url": storage.photo_url(key, base),
-        "thumb_url": thumb_url,
-        "thumb_width": thumb_width,
-        "thumb_height": thumb_height,
+        "thumb_url": _thumb_url_for(row, storage, base),
+        "thumb_width": row.get("thumb_width"),
+        "thumb_height": row.get("thumb_height"),
+        "display_url": (
+            storage.display_url(key, base)
+            if kind == "image"
+            else None
+        ),
+        "poster_url": (
+            storage.poster_url(key, base)
+            if kind == "video"
+            else None
+        ),
     }
     if admin:
         payload["client_ip"] = row.get("client_ip", "")
+        payload["guest_name"] = row.get("guest_name", "")
         payload["hidden"] = bool(row.get("hidden", 0))
+        payload["pending"] = bool(row.get("pending", 0))
     return payload
 
 
@@ -251,6 +348,79 @@ def _require_local(storage: Storage) -> LocalStorage:
     return storage
 
 
+_EXIF_BEARING_IMAGE_TYPES = frozenset({"image/jpeg", "image/heic", "image/heif"})
+
+
+def _process_local_image(
+    local: LocalStorage,
+    key: str,
+    data: bytes,
+    content_type: str,
+    strip_exif: bool,
+) -> tuple[bytes, tuple[int, int] | None]:
+    """Persist original + thumb + display. Returns bytes, dims.
+
+    EXIF/GPS is stripped only from formats that actually carry it (JPEG/HEIC);
+    PNG/WebP originals are kept byte-for-byte.
+    """
+    if strip_exif and content_type in _EXIF_BEARING_IMAGE_TYPES:
+        cleaned = sanitize_original(data, content_type)
+        if cleaned:
+            data = cleaned
+    local.save_bytes(key, data)
+    local.save_thumb(key, data)
+    local.save_display(key, data)
+    return data, image_dimensions(data)
+
+
+def _process_yandex_upload(
+    yandex: YandexStorage,
+    key: str,
+    content_type: str,
+    strip_exif: bool,
+    sniff_bytes: int,
+) -> dict[str, Any]:
+    """Sniff + derive images/videos for a confirmed bucket object (blocking, run in thread).
+
+    Downloads each image exactly once; the original is sanitized (EXIF stripped)
+    and re-uploaded. Video size is taken from the server, not the client.
+    """
+    is_img = kind_of(content_type) == "image"
+    if not yandex.settings.s3_mock:
+        head = yandex.get_head(key, sniff_bytes)
+        if head is None:
+            return {"ok": False, "reason": "notfound"}
+        if not content_matches(content_type, head):
+            yandex.delete(key)
+            return {"ok": False, "reason": "mismatch"}
+
+    if is_img:
+        raw = yandex.get_bytes(key)
+        if not raw and not yandex.settings.s3_mock:
+            return {"ok": False, "reason": "unreadable"}
+        if (
+            raw
+            and strip_exif
+            and content_type in _EXIF_BEARING_IMAGE_TYPES
+        ):
+            cleaned = sanitize_original(raw, content_type)
+            if cleaned and cleaned != raw:
+                yandex.put_bytes(key, cleaned, content_type)
+                raw = cleaned
+        if raw:
+            yandex.save_thumb(key, raw)
+            yandex.save_display(key, raw)
+        return {
+            "ok": True,
+            "kind": "image",
+            "size": len(raw) if raw else None,
+            "dims": image_dimensions(raw) if raw else None,
+        }
+
+    size = yandex.stat(key) if not yandex.settings.s3_mock else None
+    return {"ok": True, "kind": "video", "size": size}
+
+
 def _require_yandex(storage: Storage) -> YandexStorage:
     if not isinstance(storage, YandexStorage):
         raise HTTPException(
@@ -258,6 +428,72 @@ def _require_yandex(storage: Storage) -> YandexStorage:
             detail="Этот эндпоинт доступен только при STORAGE_BACKEND=yandex.",
         )
     return storage
+
+
+def _make_local_poster(
+    local: LocalStorage, key: str, ffmpeg: str
+) -> Path | None:
+    """Extract a poster frame for a just-saved local video (best-effort)."""
+    try:
+        poster = generate_poster_from_path(local.absolute_path(key), ffmpeg)
+    except Exception:
+        return None
+    if not poster:
+        return None
+    return local.save_poster(key, poster)
+
+
+def _make_yandex_poster(
+    yandex: YandexStorage, key: str, ffmpeg: str
+) -> bool:
+    """Extract a poster frame from a bucket video (best-effort).
+
+    ffmpeg reads the object over a signed URL with HTTP range requests, so only
+    the bytes it needs are fetched — the video is never downloaded whole.
+    """
+    try:
+        poster = generate_poster_from_url(yandex.photo_url(key), ffmpeg)
+        if not poster:
+            return False
+        return yandex.save_poster(key, poster)
+    except Exception:
+        logger.warning("Не удалось создать постер видео %s", key)
+        return False
+
+
+def _unlink_later(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _build_archive(storage: Storage, rows: list[dict[str, Any]]) -> str | None:
+    """Zip all visible originals into a temp file; returns its path or None."""
+    if not rows:
+        return None
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="wedding-archive-", suffix=".zip", delete=False
+    )
+    tmp_path = tmp.name
+    tmp.close()
+    with ZipFile(tmp_path, "w", compression=ZIP_STORED) as zf:
+        for row in rows:
+            key = row["object_key"]
+            arcname = key.replace("uploads/", "", 1)
+            if isinstance(storage, LocalStorage):
+                try:
+                    src = storage.absolute_path(key)
+                except ValueError:
+                    continue
+                if not src.is_file():
+                    continue
+                zf.write(src, arcname)
+            else:
+                data = storage.get_bytes(key)
+                if data:
+                    zf.writestr(arcname, data)
+    return tmp_path
 
 
 def _register_routes(api: FastAPI) -> None:
@@ -272,7 +508,6 @@ def _register_routes(api: FastAPI) -> None:
             status="ok",
             storage_backend=settings.storage_backend,
             storage_configured=storage.is_ready(),
-            storage_dir=str(storage.root) if isinstance(storage, LocalStorage) else None,
             s3_bucket=settings.s3_bucket if settings.is_yandex else None,
             max_file_size_mb=settings.max_file_size_mb,
             max_video_size_mb=settings.max_video_size_mb,
@@ -291,7 +526,7 @@ def _register_routes(api: FastAPI) -> None:
     ) -> UploadResponse:
         """Multipart upload to local disk (STORAGE_BACKEND=local)."""
         local = _require_local(storage)
-        enforce_rate_limit(request, limiter)
+        enforce_rate_limit(request, limiter, settings.trusted_proxies)
 
         if not files:
             raise HTTPException(status_code=400, detail="Нет файлов для загрузки.")
@@ -312,7 +547,7 @@ def _register_routes(api: FastAPI) -> None:
             )
 
         saved: list[UploadedPhoto] = []
-        ip = client_ip(request)
+        ip = client_ip(request, settings.trusted_proxies)
         now = datetime.now(timezone.utc).isoformat()
         base = settings.base_path
 
@@ -348,26 +583,57 @@ def _register_routes(api: FastAPI) -> None:
                 )
 
             key = build_object_key(content_type)
-            local.save_bytes(key, data)
-            local.save_thumb(key, data)
+            # Ledger entry covers a crash between writing the file and the DB row.
+            await repo.track_unconfirmed([key], now)
+            dims: tuple[int, int] | None = None
+            if kind_of(content_type) == "image":
+                data, dims = await asyncio.to_thread(
+                    _process_local_image,
+                    local,
+                    key,
+                    data,
+                    content_type,
+                    settings.strip_exif,
+                )
+            else:
+                local.save_bytes(key, data)
+                if settings.video_poster:
+                    await asyncio.to_thread(_make_local_poster, local, key, settings.ffmpeg_binary)
             row = await repo.add(
                 object_key=key,
                 content_type=content_type,
-                size_bytes=size,
+                size_bytes=len(data),
                 uploaded_at=now,
                 client_ip=ip,
+                guest_name=_guest_name(request),
+                pending=settings.pre_moderation,
+                thumb_width=dims[0] if dims else None,
+                thumb_height=dims[1] if dims else None,
+                display_width=dims[0] if dims else None,
+                display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([key])
             if row:
                 saved.append(
                     UploadedPhoto(
                         key=key,
                         content_type=content_type,
-                        size_bytes=size,
+                        size_bytes=len(data),
                         url=local.photo_url(key, base),
                         kind=kind_of(content_type),
                         thumb_url=(
                             local.thumb_url(key, base)
                             if kind_of(content_type) == "image"
+                            else None
+                        ),
+                        display_url=(
+                            local.display_url(key, base)
+                            if kind_of(content_type) == "image"
+                            else None
+                        ),
+                        poster_url=(
+                            local.poster_url(key, base)
+                            if kind_of(content_type) == "video"
                             else None
                         ),
                     )
@@ -382,10 +648,11 @@ def _register_routes(api: FastAPI) -> None:
         settings: Annotated[Settings, Depends(get_settings)],
         limiter: Annotated[RateLimiter, Depends(get_limiter)],
         storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> PresignResponse:
         """Issue browser POST policies for Yandex Object Storage."""
         yandex = _require_yandex(storage)
-        enforce_rate_limit(request, limiter)
+        enforce_rate_limit(request, limiter, settings.trusted_proxies)
 
         if not body.files:
             raise HTTPException(status_code=400, detail="Нет файлов для загрузки.")
@@ -437,6 +704,10 @@ def _register_routes(api: FastAPI) -> None:
                     fields=signed["fields"],
                 )
             )
+        # Only these keys may ever be removed by orphan cleanup (if never confirmed).
+        await repo.track_unconfirmed(
+            [item.key for item in items], datetime.now(timezone.utc).isoformat()
+        )
         return PresignResponse(items=items)
 
     @api.post("/api/uploads/confirm", response_model=ConfirmResponse)
@@ -450,7 +721,7 @@ def _register_routes(api: FastAPI) -> None:
     ) -> ConfirmResponse:
         """Record metadata after browser finished POSTing to the bucket."""
         yandex = _require_yandex(storage)
-        enforce_rate_limit(request, limiter)
+        enforce_rate_limit(request, limiter, settings.trusted_proxies)
 
         if not body.files:
             raise HTTPException(status_code=400, detail="Нечего подтверждать.")
@@ -464,7 +735,7 @@ def _register_routes(api: FastAPI) -> None:
             )
 
         saved: list[UploadedPhoto] = []
-        ip = client_ip(request)
+        ip = client_ip(request, settings.trusted_proxies)
         now = datetime.now(timezone.utc).isoformat()
         base = settings.base_path
 
@@ -477,46 +748,73 @@ def _register_routes(api: FastAPI) -> None:
                     status_code=400,
                     detail=f"Файл слишком большой. Лимит превышен.",
                 )
-            if not yandex.object_exists(file_in.key):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Объект «{file_in.key}» не найден в бакете.",
-                )
-            if not settings.s3_mock:
-                head = yandex.get_head(file_in.key, SNIFF_BYTES)
-                if head is None or not content_matches(content_type, head):
-                    logger.warning(
-                        "Отклонён %s: содержимое не совпадает с типом %s — удаляю из бакета",
-                        file_in.key,
-                        content_type,
-                    )
-                    yandex.delete(file_in.key)
+
+            result = await asyncio.to_thread(
+                _process_yandex_upload,
+                yandex,
+                file_in.key,
+                content_type,
+                settings.strip_exif,
+                SNIFF_BYTES,
+            )
+            if not result["ok"]:
+                reason = result["reason"]
+                if reason == "notfound":
                     raise HTTPException(
                         status_code=400,
-                        detail=_not_media_detail(None),
+                        detail=f"Объект «{file_in.key}» не найден в бакете.",
                     )
-            if kind_of(content_type) == "image":
-                raw = yandex.get_bytes(file_in.key)
-                if raw:
-                    yandex.save_thumb(file_in.key, raw)
+                if reason == "mismatch":
+                    # The object was deleted right away; nothing left to clean up.
+                    await repo.untrack_unconfirmed([file_in.key])
+                    raise HTTPException(status_code=400, detail=_not_media_detail(None))
+                raise HTTPException(status_code=400, detail="Не удалось прочитать объект.")
+
+            size_bytes = result.get("size") or file_in.size_bytes
+            dims = result.get("dims")
+            if (
+                result["kind"] == "video"
+                and settings.video_poster
+                and not yandex.settings.s3_mock
+            ):
+                await asyncio.to_thread(
+                    _make_yandex_poster, yandex, file_in.key, settings.ffmpeg_binary
+                )
             row = await repo.add(
                 object_key=file_in.key,
                 content_type=content_type,
-                size_bytes=file_in.size_bytes,
+                size_bytes=size_bytes,
                 uploaded_at=now,
                 client_ip=ip,
+                guest_name=_guest_name(request),
+                pending=settings.pre_moderation,
+                thumb_width=dims[0] if dims else None,
+                thumb_height=dims[1] if dims else None,
+                display_width=dims[0] if dims else None,
+                display_height=dims[1] if dims else None,
             )
+            await repo.untrack_unconfirmed([file_in.key])
             if row:
                 saved.append(
                     UploadedPhoto(
                         key=file_in.key,
                         content_type=content_type,
-                        size_bytes=file_in.size_bytes,
+                        size_bytes=size_bytes,
                         url=yandex.photo_url(file_in.key, base),
                         kind=kind_of(content_type),
                         thumb_url=(
                             yandex.thumb_url(file_in.key, base)
                             if kind_of(content_type) == "image"
+                            else None
+                        ),
+                        display_url=(
+                            yandex.display_url(file_in.key, base)
+                            if kind_of(content_type) == "image"
+                            else None
+                        ),
+                        poster_url=(
+                            yandex.poster_url(file_in.key, base)
+                            if kind_of(content_type) == "video"
                             else None
                         ),
                     )
@@ -527,22 +825,28 @@ def _register_routes(api: FastAPI) -> None:
     async def list_photos(
         request: Request,
         settings: Annotated[Settings, Depends(get_settings)],
-        limiter: Annotated[RateLimiter, Depends(get_limiter)],
         storage: Annotated[Storage, Depends(get_storage)],
         repo: Annotated[PhotoRepository, Depends(get_repo)],
         limit: int = 48,
         offset: int = 0,
         kind: str = "all",
+        guest: str | None = None,
     ) -> PhotoListResponse:
-        enforce_rate_limit(request, limiter)
+        # Public gallery is deliberately NOT rate-limited: guests on one network
+        # shouldn't be blocked, and the endpoint is cheap (metadata only).
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
         if kind not in ("all", "image", "video"):
             kind = "all"
         rows = await repo.list_recent(
-            limit=limit, offset=offset, hidden=False, kind=kind
+            limit=limit,
+            offset=offset,
+            hidden=False,
+            pending=False,
+            kind=kind,
+            guest=guest or None,
         )
-        total = await repo.count(hidden=False, kind=kind)
+        total = await repo.count(hidden=False, pending=False, kind=kind, guest=guest or None)
         base = settings.base_path
         items = [_build_photo(row, storage, base) for row in rows]
         return PhotoListResponse(
@@ -552,6 +856,25 @@ def _register_routes(api: FastAPI) -> None:
             offset=offset,
             has_more=offset + len(items) < total,
         )
+
+    @api.get("/api/photos/guests", response_model=GuestsResponse)
+    async def list_guests(
+        request: Request,
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> GuestsResponse:
+        # Names are public (they already appear in the gallery) and cheap; not
+        # rate-limited like the gallery listing.
+        return GuestsResponse(guests=await repo.list_guests(approved_only=True))
+
+    @api.get("/api/admin/photos/guests", response_model=GuestsResponse)
+    async def admin_list_guests(
+        request: Request,
+        settings: Annotated[Settings, Depends(get_settings)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> GuestsResponse:
+        # Admin sees every uploader's name, including pending / hidden items.
+        require_admin(request, settings)
+        return GuestsResponse(guests=await repo.list_guests(approved_only=False))
 
     @api.get("/api/admin/photos", response_model=AdminListResponse)
     async def admin_list_photos(
@@ -563,14 +886,23 @@ def _register_routes(api: FastAPI) -> None:
         offset: int = 0,
         kind: str = "all",
         hidden: bool | None = None,
+        pending: bool | None = None,
+        guest: str | None = None,
     ) -> AdminListResponse:
         require_admin(request, settings)
         limit = max(1, min(limit, 100))
         offset = max(0, offset)
         if kind not in ("all", "image", "video"):
             kind = "all"
-        rows = await repo.list_recent(limit=limit, offset=offset, hidden=hidden, kind=kind)
-        total = await repo.count(hidden=hidden, kind=kind)
+        rows = await repo.list_recent(
+            limit=limit,
+            offset=offset,
+            hidden=hidden,
+            pending=pending,
+            kind=kind,
+            guest=guest or None,
+        )
+        total = await repo.count(hidden=hidden, pending=pending, kind=kind, guest=guest or None)
         base = settings.base_path
         items = [_build_photo(row, storage, base, admin=True) for row in rows]
         return AdminListResponse(
@@ -582,7 +914,7 @@ def _register_routes(api: FastAPI) -> None:
         )
 
     @api.patch("/api/admin/photos/{photo_id}", response_model=AdminPhotoOut)
-    async def admin_set_hidden(
+    async def admin_update_photo(
         photo_id: int,
         body: PhotoPatchRequest,
         request: Request,
@@ -591,7 +923,13 @@ def _register_routes(api: FastAPI) -> None:
         repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> AdminPhotoOut:
         require_admin(request, settings)
-        row = await repo.set_hidden(photo_id, body.hidden)
+        row = await repo.get_by_id(photo_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Фото не найдено.")
+        if body.hidden is not None:
+            row = await repo.set_hidden(photo_id, body.hidden)
+        if body.pending is not None:
+            row = await repo.set_pending(photo_id, body.pending)
         if row is None:
             raise HTTPException(status_code=404, detail="Фото не найдено.")
         return AdminPhotoOut(**_build_photo(row, storage, settings.base_path, admin=True))
@@ -609,11 +947,43 @@ def _register_routes(api: FastAPI) -> None:
         if row is None:
             raise HTTPException(status_code=404, detail="Фото не найдено.")
         key = row["object_key"]
-        storage.delete(key)
-        if kind_of(row["content_type"]) == "image":
-            storage.delete(storage.thumb_key(key))
+        kind = kind_of(row["content_type"])
+        # Delete originals/derivatives; only drop the DB row if the object is gone.
+        deleted = await asyncio.to_thread(storage.delete, key)
+        if kind == "image":
+            await asyncio.to_thread(storage.delete, storage.thumb_key(key))
+            await asyncio.to_thread(storage.delete, storage.display_key(key))
+        else:
+            await asyncio.to_thread(storage.delete, storage.poster_key(key))
+        if not deleted and storage.is_ready():
+            raise HTTPException(
+                status_code=500,
+                detail="Не удалось удалить файл из хранилища. Запись сохранена.",
+            )
         await repo.delete(photo_id)
         return DeleteResponse(ok=True)
+
+    @api.get("/api/admin/photos/archive.zip")
+    async def admin_download_archive(
+        request: Request,
+        background_tasks: BackgroundTasks,
+        settings: Annotated[Settings, Depends(get_settings)],
+        storage: Annotated[Storage, Depends(get_storage)],
+        repo: Annotated[PhotoRepository, Depends(get_repo)],
+    ) -> FileResponse:
+        """Zip of every visible original — the couple's "all photos" backup."""
+        require_admin(request, settings)
+        rows = await repo.list_all(hidden=False, pending=False)
+        path = await asyncio.to_thread(_build_archive, storage, rows)
+        if path is None:
+            raise HTTPException(status_code=404, detail="Нет опубликованных фото.")
+        background_tasks.add_task(_unlink_later, path)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+        return FileResponse(
+            path,
+            media_type="application/zip",
+            filename=f"wedding-photos-{stamp}.zip",
+        )
 
     @api.get("/api/files/{key:path}")
     async def serve_file(
@@ -622,7 +992,8 @@ def _register_routes(api: FastAPI) -> None:
         repo: Annotated[PhotoRepository, Depends(get_repo)],
     ) -> FileResponse:
         local = _require_local(storage)
-        if not (key.startswith("uploads/") or key.startswith("thumbs/")):
+        prefix = key.split("/", 1)[0]
+        if prefix not in ("uploads", "thumbs", "display", "posters"):
             raise HTTPException(status_code=400, detail="Недопустимый ключ.")
         try:
             path = local.absolute_path(key)
@@ -631,11 +1002,18 @@ def _register_routes(api: FastAPI) -> None:
         if not path.is_file():
             raise HTTPException(status_code=404, detail="Файл не найден.")
 
-        if key.startswith("thumbs/"):
+        # Derived images (thumbs, display, video posters) are always public
+        # (EXIF-free, single frame). Originals are withheld for hidden photos so
+        # "hide" actually removes direct-link access.
+        if prefix in ("thumbs", "display", "posters"):
             return FileResponse(path, media_type="image/jpeg")
 
         meta = await repo.get_by_key(key)
-        content_type = (meta or {}).get("content_type") or "application/octet-stream"
+        if not meta:
+            raise HTTPException(status_code=404, detail="Файл не найден.")
+        if meta.get("hidden"):
+            raise HTTPException(status_code=404, detail="Файл скрыт.")
+        content_type = meta.get("content_type") or "application/octet-stream"
         return FileResponse(path, media_type=content_type)
 
     settings = get_settings()
@@ -657,7 +1035,9 @@ def create_app() -> FastAPI:
         api = FastAPI(
             title="Wedding Photo Upload",
             version="2.0.0",
-            docs_url="/api/docs",
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
             lifespan=lifespan,
         )
         api.add_middleware(
@@ -673,7 +1053,9 @@ def create_app() -> FastAPI:
     inner = FastAPI(
         title="Wedding Photo Upload",
         version="2.0.0",
-        docs_url="/api/docs",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     inner.add_middleware(
         CORSMiddleware,
