@@ -31,7 +31,8 @@ const els = {
 const state = {
   token: sessionStorage.getItem(TOKEN_KEY) || "",
   items: [],
-  offset: 0,
+  cursor: null, // next_cursor from the API
+  hasMore: false,
   total: 0,
   kind: "all",
   guest: "",
@@ -75,8 +76,8 @@ function renderTotal() {
 }
 
 function renderMore() {
-  const remaining = state.total - state.items.length;
-  if (state.items.length > 0 && remaining > 0) {
+  const remaining = Math.max(0, state.total - state.items.length);
+  if (state.items.length > 0 && state.hasMore) {
     els.adminMore.hidden = false;
     els.adminMore.textContent = `Показать ещё · осталось ${remaining}`;
     els.adminMore.disabled = state.loading;
@@ -99,8 +100,6 @@ function applyUpdate(item, updated) {
   if (!matchesFilters(item)) {
     state.items = state.items.filter((it) => it.id !== item.id);
     state.total = Math.max(0, state.total - 1);
-    // Server-side the row left this filter, so the next page starts one earlier.
-    state.offset = state.items.length;
   }
   renderList(false);
   showAlert(els.adminAlert, "", "error");
@@ -172,9 +171,6 @@ function rowActions(item, li) {
       await adminFetch(`/api/admin/photos/${item.id}`, { method: "DELETE" });
       state.items = state.items.filter((it) => it.id !== item.id);
       state.total = Math.max(0, state.total - 1);
-      // Recompute offset from what's actually shown so "Показать ещё"
-      // doesn't skip the row that shifted into the deleted item's place.
-      state.offset = state.items.length;
       renderList(false);
       showAlert(els.adminAlert, "", "error");
     } catch (err) {
@@ -244,7 +240,7 @@ async function load(reset = false) {
   const controller = new AbortController();
   inflight = controller;
   if (reset) {
-    state.offset = 0;
+    state.cursor = null;
     state.items = [];
     setStatus("Загружаю…", false);
   }
@@ -255,14 +251,16 @@ async function load(reset = false) {
     const pending = els.pendingOnly.checked ? "true" : "";
     const guest = state.guest ? `&guest=${encodeURIComponent(state.guest)}` : "";
     const data = await adminFetch(
-      `/api/admin/photos?limit=${PAGE}&offset=${state.offset}&kind=${state.kind}` +
+      `/api/admin/photos?limit=${PAGE}&kind=${state.kind}` +
+        (state.cursor ? `&cursor=${encodeURIComponent(state.cursor)}` : "") +
         `&hidden=${hidden}${pending ? `&pending=${pending}` : ""}${guest}`,
       { signal: controller.signal },
     );
     if (controller !== inflight) return; // superseded by a newer filter
     state.total = data.total;
     state.items = reset ? data.items : state.items.concat(data.items);
-    state.offset = state.items.length;
+    state.cursor = data.next_cursor;
+    state.hasMore = data.has_more;
     setStatus("", true);
     renderList(false);
     if (!state.items.length) {
@@ -372,19 +370,17 @@ async function loadAdminGuests() {
 
 async function downloadArchive() {
   try {
-    const res = await fetch(`${BASE_PATH}/api/admin/photos/archive.zip`, {
-      headers: { Authorization: `Bearer ${token()}` },
+    // A plain link can't send the Authorization header, so get a one-time
+    // token and let the browser download the (streamed) archive natively —
+    // no blob in memory, real progress, works for gigabytes.
+    const { token: oneTime } = await adminFetch("/api/admin/photos/archive-token", {
+      method: "POST",
     });
-    if (!res.ok) throw new Error(`Ошибка ${res.status}`);
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `wedding-photos-${new Date().toISOString().slice(0, 10)}.zip`;
+    a.href = `${BASE_PATH}/api/admin/photos/archive.zip?token=${encodeURIComponent(oneTime)}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
   } catch (err) {
     showAlert(els.adminAlert, `Не удалось скачать архив: ${err.message}`, "error");
   }

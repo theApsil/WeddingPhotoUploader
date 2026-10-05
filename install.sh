@@ -276,29 +276,6 @@ EOF
   log "Записан ${env_path} (режим 600)"
 }
 
-set_frontend_base_path() {
-  local content="${BASE_PATH}"
-  local file
-  for file in "${PROJECT_ROOT}/frontend/index.html" \
-              "${PROJECT_ROOT}/frontend/gallery.html"; do
-    [[ -f "${file}" ]] || continue
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      log "DRY-RUN: would set meta base-path='${content}' in ${file}"
-      continue
-    fi
-    if grep -q 'name="base-path"' "${file}"; then
-      sed -i -E \
-        "s|(name=\"base-path\" content=\")[^\"]*(\")|\\1${content}\\2|" \
-        "${file}"
-    else
-      sed -i \
-        "s|<meta name=\"theme-color\"|<meta name=\"base-path\" content=\"${content}\">\n  <meta name=\"theme-color\"|" \
-        "${file}"
-    fi
-  done
-  log "meta base-path=${content:-'(root)'} в HTML"
-}
-
 render_template() {
   local src="$1"
   local server_name="$2"
@@ -619,7 +596,6 @@ main() {
   install_packages
   setup_venv
   write_env_file
-  set_frontend_base_path
   write_systemd_unit
   write_nginx_config
   maybe_certbot

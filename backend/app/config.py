@@ -80,7 +80,9 @@ class Settings(BaseSettings):
     storage_domain: str = Field(default="", alias="STORAGE_DOMAIN")
     public_read: bool = Field(default=False, alias="PUBLIC_READ")
     s3_mock: bool = Field(default=False, alias="S3_MOCK")
-    presign_expires_seconds: int = Field(default=3600, alias="PRESIGN_EXPIRES_SECONDS")
+    # Signed bucket URLs. Gallery images go through /api/media redirects that the
+    # browser caches for half of this, so keep it long (12 h).
+    presign_expires_seconds: int = Field(default=43200, alias="PRESIGN_EXPIRES_SECONDS")
 
     # Generate a poster frame (ffmpeg) for uploaded videos so the gallery tile
     # shows a real preview instead of a blank play button.
